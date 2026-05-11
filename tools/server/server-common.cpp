@@ -395,7 +395,10 @@ void server_tokens::insert(const llama_tokens & inp_tokens) {
 }
 
 const llama_tokens & server_tokens::get_tokens() const {
-    GGML_ASSERT(!has_mtmd);
+    // SAIVerse fork: was GGML_ASSERT(!has_mtmd).
+    // Removed because slot save/restore needs to access the raw token stream (including
+    // LLAMA_TOKEN_NULL placeholders at image/audio positions) to persist KV cache state.
+    // Callers that need text-only tokens (no LLAMA_TOKEN_NULL) should use get_text_tokens().
     return tokens;
 }
 
@@ -411,7 +414,12 @@ llama_tokens server_tokens::get_text_tokens() const {
 }
 
 void server_tokens::set_token(llama_pos pos, llama_token id) {
-    GGML_ASSERT(!has_mtmd); // only allow this if mtmd is disabled
+    // SAIVerse fork: relaxed from GGML_ASSERT(!has_mtmd).
+    // Allow set_token when mmproj is loaded but no actual media chunks are present
+    // (e.g. text-only conversation on a multimodal-capable server).
+    // Still forbidden when media chunks exist - overwriting an image position would
+    // desync map_idx_to_media from tokens.
+    GGML_ASSERT(!has_mtmd || map_idx_to_media.empty());
     tokens[pos] = id;
 }
 
@@ -572,6 +580,232 @@ server_tokens server_tokens::clone() const {
         res.map_idx_to_media[idx] = mtmd::input_chunk_ptr(mtmd_input_chunk_copy(chunk.get()));
     }
     return res;
+}
+
+//
+// SAIVerse fork extension: mtmd sidecar save/load
+//
+// Sidecar file format (see docs/intent/llama_cpp_multimodal_slot_save_fork.md §5):
+//   [magic "MTMD" 4][version u32 = 1][mmproj_hash 32B][total_tokens u64][n_chunks u64]
+//   foreach chunk: [start_idx u64][chunk_type u32][chunk_size u64][chunk_data ...]
+//   [footer "DTMD" 4]
+//
+
+namespace {
+
+constexpr char     MTMD_SIDECAR_MAGIC[4]        = { 'M', 'T', 'M', 'D' };
+constexpr char     MTMD_SIDECAR_FOOTER[4]       = { 'D', 'T', 'M', 'D' };
+constexpr uint32_t MTMD_SIDECAR_VERSION         = 1;
+constexpr size_t   MTMD_SIDECAR_HASH_LEN        = 32;  // SHA-256
+
+bool write_to_stream(std::ofstream & out, const void * data, size_t n) {
+    out.write(reinterpret_cast<const char *>(data), static_cast<std::streamsize>(n));
+    return out.good();
+}
+
+bool read_from_stream(std::ifstream & in, void * data, size_t n) {
+    in.read(reinterpret_cast<char *>(data), static_cast<std::streamsize>(n));
+    return in.good();
+}
+
+} // anonymous namespace
+
+size_t server_tokens::save_mtmd_sidecar(const std::string & filepath,
+                                          const std::vector<uint8_t> & mmproj_hash) const {
+    if (mmproj_hash.size() != MTMD_SIDECAR_HASH_LEN) {
+        SRV_ERR("save_mtmd_sidecar: mmproj_hash must be %zu bytes (got %zu)\n",
+                MTMD_SIDECAR_HASH_LEN, mmproj_hash.size());
+        return 0;
+    }
+
+    std::ofstream out(filepath, std::ios::binary | std::ios::trunc);
+    if (!out.is_open()) {
+        SRV_ERR("save_mtmd_sidecar: failed to open %s for writing\n", filepath.c_str());
+        return 0;
+    }
+
+    const uint64_t total_tokens = tokens.size();
+    const uint64_t n_chunks     = map_idx_to_media.size();
+
+    // Header
+    if (!write_to_stream(out, MTMD_SIDECAR_MAGIC, 4))                      return 0;
+    if (!write_to_stream(out, &MTMD_SIDECAR_VERSION, sizeof(uint32_t)))    return 0;
+    if (!write_to_stream(out, mmproj_hash.data(), MTMD_SIDECAR_HASH_LEN))  return 0;
+    if (!write_to_stream(out, &total_tokens, sizeof(uint64_t)))            return 0;
+    if (!write_to_stream(out, &n_chunks, sizeof(uint64_t)))                return 0;
+
+    // Chunks
+    std::vector<uint8_t> chunk_buf;
+    for (const auto & it : map_idx_to_media) {
+        const uint64_t start_idx       = it.first;
+        const mtmd_input_chunk * chunk = it.second.get();
+        if (!chunk) {
+            SRV_ERR("save_mtmd_sidecar: null chunk at idx %" PRIu64 "\n", start_idx);
+            return 0;
+        }
+
+        const uint32_t chunk_type   = static_cast<uint32_t>(mtmd_input_chunk_get_type(chunk));
+        const size_t   need         = mtmd_input_chunk_serialized_size(chunk);
+        const uint64_t chunk_size   = need;
+
+        chunk_buf.resize(need);
+        const size_t wrote = mtmd_input_chunk_serialize(chunk, chunk_buf.data(), chunk_buf.size());
+        if (wrote != need) {
+            SRV_ERR("save_mtmd_sidecar: mtmd_input_chunk_serialize wrote %zu, expected %zu\n",
+                    wrote, need);
+            return 0;
+        }
+
+        if (!write_to_stream(out, &start_idx, sizeof(uint64_t)))          return 0;
+        if (!write_to_stream(out, &chunk_type, sizeof(uint32_t)))         return 0;
+        if (!write_to_stream(out, &chunk_size, sizeof(uint64_t)))         return 0;
+        if (chunk_size > 0) {
+            if (!write_to_stream(out, chunk_buf.data(), chunk_buf.size())) return 0;
+        }
+    }
+
+    // Footer
+    if (!write_to_stream(out, MTMD_SIDECAR_FOOTER, 4))                    return 0;
+
+    out.close();
+    if (!out.good()) {
+        SRV_ERR("save_mtmd_sidecar: failed to flush/close %s\n", filepath.c_str());
+        return 0;
+    }
+
+    // Return total bytes written
+    const std::streamsize sz = static_cast<std::streamsize>(
+        4                                          // magic
+        + sizeof(uint32_t)                         // version
+        + MTMD_SIDECAR_HASH_LEN                    // hash
+        + sizeof(uint64_t) * 2                     // total_tokens + n_chunks
+        + 4                                        // footer
+    );
+    size_t per_chunk_overhead = sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint64_t); // start_idx+type+chunk_size
+    size_t total = static_cast<size_t>(sz);
+    for (const auto & it : map_idx_to_media) {
+        total += per_chunk_overhead;
+        total += mtmd_input_chunk_serialized_size(it.second.get());
+    }
+    return total;
+}
+
+bool server_tokens::load_mtmd_sidecar(const std::string & filepath,
+                                       const std::vector<uint8_t> & expected_mmproj_hash) {
+    if (expected_mmproj_hash.size() != MTMD_SIDECAR_HASH_LEN) {
+        SRV_ERR("load_mtmd_sidecar: expected_mmproj_hash must be %zu bytes (got %zu)\n",
+                MTMD_SIDECAR_HASH_LEN, expected_mmproj_hash.size());
+        return false;
+    }
+
+    std::ifstream in(filepath, std::ios::binary);
+    if (!in.is_open()) {
+        SRV_ERR("load_mtmd_sidecar: failed to open %s for reading\n", filepath.c_str());
+        return false;
+    }
+
+    // Header: magic
+    char magic[4] = {0};
+    if (!read_from_stream(in, magic, 4))                                   return false;
+    if (std::memcmp(magic, MTMD_SIDECAR_MAGIC, 4) != 0) {
+        SRV_ERR("load_mtmd_sidecar: bad magic in %s\n", filepath.c_str());
+        return false;
+    }
+
+    // Header: version
+    uint32_t version = 0;
+    if (!read_from_stream(in, &version, sizeof(uint32_t)))                 return false;
+    if (version != MTMD_SIDECAR_VERSION) {
+        SRV_ERR("load_mtmd_sidecar: unsupported version %u in %s (expected %u)\n",
+                version, filepath.c_str(), MTMD_SIDECAR_VERSION);
+        return false;
+    }
+
+    // Header: mmproj_hash
+    uint8_t file_hash[MTMD_SIDECAR_HASH_LEN] = {0};
+    if (!read_from_stream(in, file_hash, MTMD_SIDECAR_HASH_LEN))           return false;
+    if (std::memcmp(file_hash, expected_mmproj_hash.data(), MTMD_SIDECAR_HASH_LEN) != 0) {
+        SRV_ERR("load_mtmd_sidecar: mmproj_hash mismatch in %s "
+                "(cache was saved with a different mmproj)\n", filepath.c_str());
+        return false;
+    }
+
+    // Header: total_tokens, n_chunks
+    uint64_t total_tokens = 0, n_chunks = 0;
+    if (!read_from_stream(in, &total_tokens, sizeof(uint64_t)))            return false;
+    if (!read_from_stream(in, &n_chunks, sizeof(uint64_t)))                return false;
+
+    // Cross-check with current tokens size
+    if (total_tokens != tokens.size()) {
+        SRV_ERR("load_mtmd_sidecar: total_tokens mismatch in %s "
+                "(file=%" PRIu64 ", current=%zu)\n",
+                filepath.c_str(), total_tokens, tokens.size());
+        return false;
+    }
+
+    // Read chunks
+    map_idx_to_media.clear();
+    std::vector<uint8_t> chunk_buf;
+    for (uint64_t i = 0; i < n_chunks; ++i) {
+        uint64_t start_idx = 0;
+        uint32_t chunk_type = 0;
+        uint64_t chunk_size = 0;
+        if (!read_from_stream(in, &start_idx, sizeof(uint64_t)))            return false;
+        if (!read_from_stream(in, &chunk_type, sizeof(uint32_t)))           return false;
+        if (!read_from_stream(in, &chunk_size, sizeof(uint64_t)))           return false;
+
+        // Sanity check: prevent absurd allocations
+        constexpr uint64_t MTMD_SIDECAR_MAX_CHUNK_BYTES = 256ULL * 1024 * 1024; // 256 MiB
+        if (chunk_size > MTMD_SIDECAR_MAX_CHUNK_BYTES) {
+            SRV_ERR("load_mtmd_sidecar: chunk %" PRIu64 " size %" PRIu64
+                    " exceeds %" PRIu64 " in %s\n",
+                    i, chunk_size, (uint64_t) MTMD_SIDECAR_MAX_CHUNK_BYTES,
+                    filepath.c_str());
+            return false;
+        }
+
+        chunk_buf.resize(chunk_size);
+        if (chunk_size > 0) {
+            if (!read_from_stream(in, chunk_buf.data(), chunk_size))        return false;
+        }
+
+        size_t bytes_read = 0;
+        mtmd_input_chunk * raw = mtmd_input_chunk_deserialize(
+            chunk_buf.data(), chunk_buf.size(), &bytes_read);
+        if (!raw) {
+            SRV_ERR("load_mtmd_sidecar: mtmd_input_chunk_deserialize failed at idx %" PRIu64
+                    " in %s\n", i, filepath.c_str());
+            return false;
+        }
+        if (bytes_read != chunk_size) {
+            SRV_ERR("load_mtmd_sidecar: chunk %" PRIu64 " bytes_read=%zu != chunk_size=%" PRIu64
+                    " in %s\n", i, bytes_read, chunk_size, filepath.c_str());
+            mtmd_input_chunk_free(raw);
+            return false;
+        }
+
+        // Cross-check chunk_type with the deserialized value
+        const uint32_t actual_type = static_cast<uint32_t>(mtmd_input_chunk_get_type(raw));
+        if (actual_type != chunk_type) {
+            SRV_ERR("load_mtmd_sidecar: chunk_type mismatch at idx %" PRIu64
+                    " (header=%u, body=%u) in %s\n",
+                    i, chunk_type, actual_type, filepath.c_str());
+            mtmd_input_chunk_free(raw);
+            return false;
+        }
+
+        map_idx_to_media[static_cast<size_t>(start_idx)] = mtmd::input_chunk_ptr(raw);
+    }
+
+    // Footer
+    char footer[4] = {0};
+    if (!read_from_stream(in, footer, 4))                                  return false;
+    if (std::memcmp(footer, MTMD_SIDECAR_FOOTER, 4) != 0) {
+        SRV_ERR("load_mtmd_sidecar: bad footer in %s\n", filepath.c_str());
+        return false;
+    }
+
+    return true;
 }
 
 //

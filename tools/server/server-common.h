@@ -225,6 +225,24 @@ public:
                 size_t & n_tokens_out) const;
 
     server_tokens clone() const;
+
+    // SAIVerse fork extension: multimodal slot save/restore sidecar
+    //
+    // has_media_chunks: true if this server_tokens contains image/audio chunks (not just text).
+    //   Used to decide whether to write a .mtmd sidecar file alongside the KV cache file.
+    bool has_media_chunks() const { return !map_idx_to_media.empty(); }
+
+    // Save map_idx_to_media + per-chunk metadata to a sidecar file.
+    // 'mmproj_hash' (32 bytes SHA-256) is embedded for compatibility verification on load.
+    // Returns number of bytes written (0 on failure).
+    size_t save_mtmd_sidecar(const std::string & filepath,
+                              const std::vector<uint8_t> & mmproj_hash) const;
+
+    // Restore map_idx_to_media from a sidecar file.
+    // 'expected_mmproj_hash' is compared against the hash embedded in the file; mismatch returns false.
+    // Returns true on success. On failure, this server_tokens may be partially modified.
+    bool load_mtmd_sidecar(const std::string & filepath,
+                            const std::vector<uint8_t> & expected_mmproj_hash);
 };
 
 

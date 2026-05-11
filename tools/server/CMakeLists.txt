@@ -17,6 +17,8 @@ add_library(${TARGET} STATIC
     server-context.h
     server-tools.cpp
     server-tools.h
+    sha256.c
+    sha256.h
 )
 
 if (BUILD_SHARED_LIBS)

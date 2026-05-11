@@ -18,10 +18,17 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cstring>
 #include <exception>
+#include <fstream>
 #include <memory>
 #include <filesystem>
 #include <utility>
+
+// SAIVerse fork extension: SHA-256 for mmproj fingerprint
+extern "C" {
+#include "sha256.h"
+}
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -632,6 +639,56 @@ struct server_metrics {
 
 
 //
+// SAIVerse fork extension: helper for mmproj fingerprint (SHA-256)
+//
+
+namespace {
+
+// Compute SHA-256 of a file. Returns 32-byte digest on success, empty vector on error.
+std::vector<uint8_t> compute_file_sha256(const std::string & filepath) {
+    std::ifstream in(filepath, std::ios::binary);
+    if (!in.is_open()) {
+        SRV_ERR("compute_file_sha256: failed to open %s\n", filepath.c_str());
+        return {};
+    }
+
+    sha256_t sha;
+    sha256_init(&sha);
+    std::vector<char> buf(64 * 1024);
+    while (in) {
+        in.read(buf.data(), buf.size());
+        const std::streamsize n = in.gcount();
+        if (n > 0) {
+            sha256_update(&sha, reinterpret_cast<const unsigned char *>(buf.data()),
+                          static_cast<size_t>(n));
+        }
+    }
+
+    if (in.bad()) {
+        SRV_ERR("compute_file_sha256: read error on %s\n", filepath.c_str());
+        return {};
+    }
+
+    std::vector<uint8_t> digest(SHA256_DIGEST_SIZE);
+    sha256_final(&sha, digest.data());
+    return digest;
+}
+
+std::string hex_of(const std::vector<uint8_t> & bytes) {
+    static const char * hex = "0123456789abcdef";
+    std::string out;
+    out.reserve(bytes.size() * 2);
+    for (uint8_t b : bytes) {
+        out.push_back(hex[b >> 4]);
+        out.push_back(hex[b & 0xf]);
+    }
+    return out;
+}
+
+} // anonymous namespace
+
+
+//
 // server_context_impl (private implementation)
 //
 
@@ -665,6 +722,10 @@ private:
     // use server_context methods instead
 
     common_params params_base;
+
+    // SAIVerse fork extension: SHA-256 of the loaded mmproj file.
+    // Empty when no mmproj is loaded. Used by slot save/restore to verify cache compatibility.
+    std::vector<uint8_t> mmproj_hash;
 
     // note: keep these alive - they determine the lifetime of the model, context, etc.
     common_init_result_ptr llama_init;
@@ -832,6 +893,16 @@ private:
                 return false;
             }
             SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
+
+            // SAIVerse fork extension: compute SHA-256 of mmproj file for slot save/restore compatibility check.
+            // If hashing fails, log a warning but continue - slot save/restore will be unavailable.
+            mmproj_hash = compute_file_sha256(mmproj_path);
+            if (mmproj_hash.empty()) {
+                SRV_WRN("failed to compute SHA-256 of mmproj '%s'; "
+                        "multimodal slot save/restore will be disabled\n", mmproj_path.c_str());
+            } else {
+                SRV_INF("mmproj SHA-256: %s\n", hex_of(mmproj_hash).c_str());
+            }
 
             if (params_base.ctx_shift) {
                 params_base.ctx_shift = false;
@@ -1562,14 +1633,8 @@ private:
         queue_results.send(std::move(res));
     }
 
-    // if multimodal is enabled, send an error and return false
-    bool check_no_mtmd(const int id_task) {
-        if (mctx) {
-            send_error(id_task, "This feature is not supported by multimodal", ERROR_TYPE_NOT_SUPPORTED);
-            return false;
-        }
-        return true;
-    }
+    // SAIVerse fork: removed check_no_mtmd() — slot save/restore/erase now work with mmproj
+    // via the .mtmd sidecar mechanism (see server_tokens::save/load_mtmd_sidecar).
 
     void send_partial_response(server_slot & slot, const completion_token_output & tkn, bool is_progress) {
         auto res = std::make_unique<server_task_result_cmpl_partial>();
@@ -1979,10 +2044,6 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_SAVE:
                 {
-                    if (!check_no_mtmd(task.id)) {
-                        break;
-                    }
-
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
@@ -2005,6 +2066,24 @@ private:
                     const llama_tokens & tokens = slot->prompt.tokens.get_tokens();
                     const size_t nwrite = llama_state_seq_save_file(ctx, filepath.c_str(), slot->id, tokens.data(), token_count);
 
+                    // SAIVerse fork extension: save mtmd sidecar if multimodal media chunks exist
+                    size_t nwrite_mtmd = 0;
+                    if (mctx && slot->prompt.tokens.has_media_chunks()) {
+                        if (mmproj_hash.empty()) {
+                            send_error(task, "mmproj fingerprint not available; "
+                                              "cannot save slot with multimodal data",
+                                       ERROR_TYPE_SERVER);
+                            break;
+                        }
+                        const std::string mtmd_filepath = filepath + ".mtmd";
+                        nwrite_mtmd = slot->prompt.tokens.save_mtmd_sidecar(mtmd_filepath, mmproj_hash);
+                        if (nwrite_mtmd == 0) {
+                            send_error(task, "Failed to save mtmd sidecar file",
+                                       ERROR_TYPE_SERVER);
+                            break;
+                        }
+                    }
+
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -2014,13 +2093,12 @@ private:
                     res->filename = filename;
                     res->is_save  = true;
                     res->n_tokens = token_count;
-                    res->n_bytes  = nwrite;
+                    res->n_bytes  = nwrite + nwrite_mtmd;
                     res->t_ms     = t_save_ms;
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SLOT_RESTORE:
                 {
-                    if (!check_no_mtmd(task.id)) break;
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
@@ -2052,6 +2130,45 @@ private:
                     slot->prompt.tokens.clear();
                     slot->prompt.tokens.insert(tokens);
 
+                    // SAIVerse fork extension: load mtmd sidecar if present.
+                    // Sidecar policy:
+                    //   - sidecar present + mmproj loaded + hash matches → load (full multimodal restore)
+                    //   - sidecar present + no mmproj                  → reject (LLAMA_TOKEN_NULL placeholders would break inference)
+                    //   - sidecar present + hash mismatch              → reject (different mmproj)
+                    //   - sidecar absent                                → text-only restore (existing behavior)
+                    size_t nread_mtmd = 0;
+                    const std::string mtmd_filepath = filepath + ".mtmd";
+                    if (std::filesystem::exists(mtmd_filepath)) {
+                        if (!mctx) {
+                            slot->prompt.tokens.clear();
+                            send_error(task,
+                                "Cannot restore multimodal cache without mmproj; "
+                                "start the server with --mmproj to use this cache file",
+                                ERROR_TYPE_INVALID_REQUEST);
+                            break;
+                        }
+                        if (mmproj_hash.empty()) {
+                            slot->prompt.tokens.clear();
+                            send_error(task,
+                                "mmproj fingerprint not available; cannot verify cache compatibility",
+                                ERROR_TYPE_SERVER);
+                            break;
+                        }
+                        if (!slot->prompt.tokens.load_mtmd_sidecar(mtmd_filepath, mmproj_hash)) {
+                            slot->prompt.tokens.clear();
+                            send_error(task,
+                                "Failed to load mtmd sidecar (mmproj mismatch, version mismatch, or corrupt file)",
+                                ERROR_TYPE_INVALID_REQUEST);
+                            break;
+                        }
+                        // record bytes read for response
+                        std::error_code ec;
+                        const auto sz = std::filesystem::file_size(mtmd_filepath, ec);
+                        if (!ec) {
+                            nread_mtmd = static_cast<size_t>(sz);
+                        }
+                    }
+
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
 
@@ -2061,15 +2178,15 @@ private:
                     res->filename = filename;
                     res->is_save  = false;
                     res->n_tokens = token_count;
-                    res->n_bytes  = nread;
+                    res->n_bytes  = nread + nread_mtmd;
                     res->t_ms     = t_restore_ms;
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SLOT_ERASE:
                 {
-                    if (!check_no_mtmd(task.id)) {
-                        break;
-                    }
+                    // SAIVerse fork: check_no_mtmd guard removed.
+                    // SLOT_ERASE only clears in-memory KV state and never touches sidecar files
+                    // (matching the existing behavior where the on-disk .bin is also not deleted).
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
