@@ -23,6 +23,7 @@
 #include <cstring>
 #include <climits>
 #include <type_traits>
+#include <limits>
 #include <vector>
 
 // remember to bump this if the serialization format changes
@@ -2297,6 +2298,457 @@ mtmd_input_chunk * mtmd_input_chunk_load(const char * buf, size_t len) {
     }
 }
 
+//
+// SAIVerse fork extension: mtmd_input_chunk serialize / deserialize
+//
+// Used by the server slot save/restore API to persist multimodal KV cache sidecar files.
+// Endianness: native (sidecar files are not portable across architectures by design).
+//
+
+namespace {
+
+constexpr size_t MTMD_SERIALIZED_MAX_FLOATS = 256ULL * 1024 * 1024 / sizeof(float);
+
+bool checked_add(size_t & total, size_t value) {
+    if (value > std::numeric_limits<size_t>::max() - total) {
+        return false;
+    }
+    total += value;
+    return true;
+}
+
+bool checked_mul(size_t lhs, size_t rhs, size_t & result) {
+    if (lhs != 0 && rhs > std::numeric_limits<size_t>::max() / lhs) {
+        return false;
+    }
+    result = lhs * rhs;
+    return true;
+}
+
+bool has_bytes(size_t offset, size_t n, size_t buf_size) {
+    return offset <= buf_size && n <= buf_size - offset;
+}
+
+bool write_bytes(uint8_t * buf, size_t buf_size, size_t & offset, const void * src, size_t n) {
+    if (!has_bytes(offset, n, buf_size)) {
+        return false;
+    }
+    std::memcpy(buf + offset, src, n);
+    offset += n;
+    return true;
+}
+
+bool read_bytes(const uint8_t * buf, size_t buf_size, size_t & offset, void * dst, size_t n) {
+    if (!has_bytes(offset, n, buf_size)) {
+        return false;
+    }
+    std::memcpy(dst, buf + offset, n);
+    offset += n;
+    return true;
+}
+
+template <typename T>
+bool write_scalar(uint8_t * buf, size_t buf_size, size_t & offset, T value) {
+    return write_bytes(buf, buf_size, offset, &value, sizeof(T));
+}
+
+template <typename T>
+bool read_scalar(const uint8_t * buf, size_t buf_size, size_t & offset, T & value) {
+    return read_bytes(buf, buf_size, offset, &value, sizeof(T));
+}
+
+// ---- clip_image_f32_batch ----
+
+// Versions this build can write. Version 3 is read-only: see the note on
+// MTMD_INPUT_CHUNK_SERIALIZATION_VERSION in mtmd.h.
+bool serialization_version_writable(uint32_t version) {
+    return version >= 2 && version <= MTMD_INPUT_CHUNK_SERIALIZATION_VERSION && version != 3;
+}
+
+bool serialization_version_readable(uint32_t version) {
+    return version >= 2 && version <= MTMD_INPUT_CHUNK_SERIALIZATION_VERSION;
+}
+
+bool batch_f32_serialized_size(const clip_image_f32_batch & batch, size_t & result, uint32_t version) {
+    size_t n = sizeof(uint8_t) + sizeof(uint64_t);
+    for (const auto & entry : batch.entries) {
+        const size_t buf_count = entry.is_placeholder() ? 0 : entry.get_ro_buf().size();
+        size_t buf_bytes = 0;
+        const size_t flags_size = version >= 3 ? 2 * sizeof(uint8_t) : 0;
+        if (!checked_mul(buf_count, sizeof(float), buf_bytes) ||
+            !checked_add(n, 2 * sizeof(int32_t) + flags_size + sizeof(uint64_t)) ||
+            !checked_add(n, buf_bytes)) {
+            return false;
+        }
+    }
+    result = n;
+    return true;
+}
+
+bool batch_f32_serialize(uint8_t * buf, size_t buf_size, size_t & offset,
+                          const clip_image_f32_batch & batch, uint32_t version) {
+    const uint8_t is_audio = batch.is_audio ? 1 : 0;
+    if (!write_scalar<uint8_t>(buf, buf_size, offset, is_audio))        return false;
+
+    const uint64_t n_entries = batch.entries.size();
+    if (!write_scalar<uint64_t>(buf, buf_size, offset, n_entries))      return false;
+
+    for (const auto & entry : batch.entries) {
+        if (!write_scalar<int32_t>(buf, buf_size, offset, entry.nx()))  return false;
+        if (!write_scalar<int32_t>(buf, buf_size, offset, entry.ny()))  return false;
+        if (version >= 3) {
+            const uint8_t add_viewsep = entry.add_viewsep ? 1 : 0;
+            const uint8_t add_newline = entry.add_newline ? 1 : 0;
+            if (!write_scalar<uint8_t>(buf, buf_size, offset, add_viewsep)) return false;
+            if (!write_scalar<uint8_t>(buf, buf_size, offset, add_newline)) return false;
+        }
+        const uint64_t buf_count = entry.is_placeholder() ? 0 : entry.get_ro_buf().size();
+        if (!write_scalar<uint64_t>(buf, buf_size, offset, buf_count)) return false;
+        if (buf_count > 0) {
+            if (!write_bytes(buf, buf_size, offset,
+                              entry.get_ro_buf().data(),
+                              buf_count * sizeof(float))) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool batch_f32_deserialize(const uint8_t * buf, size_t buf_size, size_t & offset,
+                            clip_image_f32_batch & out, uint32_t version) {
+    uint8_t is_audio_u8 = 0;
+    uint64_t n_entries = 0;
+    if (!read_scalar<uint8_t>(buf, buf_size, offset, is_audio_u8) || is_audio_u8 > 1) {
+        return false;
+    }
+    if (version == 3) {
+        // Version 3 embedded clip_image_f32_batch::grid_x / grid_y. Those fields no
+        // longer exist on the struct, so consume them to stay aligned and drop them.
+        int32_t grid_x = 0;
+        int32_t grid_y = 0;
+        if (!read_scalar<int32_t>(buf, buf_size, offset, grid_x) || grid_x < 0) return false;
+        if (!read_scalar<int32_t>(buf, buf_size, offset, grid_y) || grid_y < 0) return false;
+    }
+    if (!read_scalar<uint64_t>(buf, buf_size, offset, n_entries)) return false;
+
+    out.is_audio = (is_audio_u8 != 0);
+    out.entries.clear();
+
+    const size_t entry_header_size = 2 * sizeof(int32_t) + sizeof(uint64_t) +
+        (version >= 3 ? 2 * sizeof(uint8_t) : 0);
+    if (n_entries > (buf_size - offset) / entry_header_size) {
+        return false;
+    }
+    out.entries.reserve(static_cast<size_t>(n_entries));
+
+    for (uint64_t i = 0; i < n_entries; ++i) {
+        int32_t nx = 0, ny = 0;
+        uint8_t add_viewsep = 0, add_newline = 0;
+        uint64_t buf_count = 0;
+        if (!read_scalar<int32_t>(buf, buf_size, offset, nx) || nx < 0) return false;
+        if (!read_scalar<int32_t>(buf, buf_size, offset, ny) || ny < 0) return false;
+        if (version >= 3) {
+            if (!read_scalar<uint8_t>(buf, buf_size, offset, add_viewsep) || add_viewsep > 1) return false;
+            if (!read_scalar<uint8_t>(buf, buf_size, offset, add_newline) || add_newline > 1) return false;
+        }
+        if (!read_scalar<uint64_t>(buf, buf_size, offset, buf_count)) return false;
+
+        if (buf_count > MTMD_SERIALIZED_MAX_FLOATS) {
+            return false;
+        }
+        size_t base_count = 0;
+        if (!checked_mul(static_cast<size_t>(nx), static_cast<size_t>(ny), base_count) ||
+            (!out.is_audio && !checked_mul(base_count, 3, base_count)) ||
+            (buf_count > 0 && base_count > buf_count)) {
+            return false;
+        }
+        size_t buf_bytes = 0;
+        if (!checked_mul(static_cast<size_t>(buf_count), sizeof(float), buf_bytes) ||
+            !has_bytes(offset, buf_bytes, buf_size)) {
+            return false;
+        }
+
+        clip_image_f32 entry;
+        entry.set_size({nx, ny}, buf_count == 0, out.is_audio);
+        entry.add_viewsep = add_viewsep != 0;
+        entry.add_newline = add_newline != 0;
+        if (buf_count > 0) {
+            std::vector<float> temp(static_cast<size_t>(buf_count));
+            if (!read_bytes(buf, buf_size, offset,
+                             temp.data(),
+                             buf_bytes)) {
+                return false;
+            }
+            entry.cpy_buf(temp);
+        }
+        out.entries.emplace_back(std::move(entry));
+    }
+    return true;
+}
+
+// ---- mtmd_image_tokens ----
+
+bool image_tokens_serialized_size(const mtmd_image_tokens & img, size_t & result, uint32_t version) {
+    size_t batch_size = 0;
+    if (!batch_f32_serialized_size(img.batch_f32, batch_size, version)) {
+        return false;
+    }
+    size_t n = 5 * sizeof(uint32_t) + sizeof(uint64_t);
+    if (!checked_add(n, img.id.size()) || !checked_add(n, batch_size)) {
+        return false;
+    }
+    result = n;
+    return true;
+}
+
+bool image_tokens_serialize(uint8_t * buf, size_t buf_size, size_t & offset,
+                             const mtmd_image_tokens & img, uint32_t version) {
+    if (!write_scalar<uint32_t>(buf, buf_size, offset, img.nx))                    return false;
+    if (!write_scalar<uint32_t>(buf, buf_size, offset, img.ny))                    return false;
+    if (!write_scalar<uint32_t>(buf, buf_size, offset, (uint32_t) img.pos))        return false;
+    if (!write_scalar<uint32_t>(buf, buf_size, offset, img.image_idx))             return false;
+    if (!write_scalar<uint32_t>(buf, buf_size, offset, img.n_temporal_merge))      return false;
+    const uint64_t id_len = img.id.size();
+    if (!write_scalar<uint64_t>(buf, buf_size, offset, id_len))                    return false;
+    if (id_len > 0) {
+        if (!write_bytes(buf, buf_size, offset, img.id.data(), id_len))            return false;
+    }
+    return batch_f32_serialize(buf, buf_size, offset, img.batch_f32, version);
+}
+
+bool image_tokens_deserialize(const uint8_t * buf, size_t buf_size, size_t & offset,
+                               mtmd_image_tokens & out, uint32_t version) {
+    uint32_t nx = 0, ny = 0, pos = 0, image_idx = 0, n_temporal_merge = 1;
+    uint64_t id_len = 0;
+    if (!read_scalar<uint32_t>(buf, buf_size, offset, nx))                return false;
+    if (!read_scalar<uint32_t>(buf, buf_size, offset, ny))                return false;
+    if (!read_scalar<uint32_t>(buf, buf_size, offset, pos))               return false;
+    if (!read_scalar<uint32_t>(buf, buf_size, offset, image_idx))         return false;
+    if (!read_scalar<uint32_t>(buf, buf_size, offset, n_temporal_merge))  return false;
+    if (!read_scalar<uint64_t>(buf, buf_size, offset, id_len))            return false;
+
+    if (pos > MTMD_POS_TYPE_HUNYUANVL || n_temporal_merge == 0 ||
+        id_len > buf_size - offset) {
+        return false;
+    }
+
+    out.nx               = nx;
+    out.ny               = ny;
+    out.pos              = (mtmd_pos_type) pos;
+    out.image_idx        = image_idx;
+    out.n_temporal_merge = n_temporal_merge;
+    out.id.resize(id_len);
+    if (id_len > 0) {
+        if (!read_bytes(buf, buf_size, offset, out.id.data(), id_len)) return false;
+    }
+    return batch_f32_deserialize(buf, buf_size, offset, out.batch_f32, version) &&
+        !out.batch_f32.is_audio;
+}
+
+// ---- mtmd_audio_tokens ----
+
+bool audio_tokens_serialized_size(const mtmd_audio_tokens & audio, size_t & result, uint32_t version) {
+    size_t batch_size = 0;
+    if (!batch_f32_serialized_size(audio.batch_f32, batch_size, version)) {
+        return false;
+    }
+    size_t n = sizeof(uint32_t) + sizeof(uint64_t);
+    if (!checked_add(n, audio.id.size()) || !checked_add(n, batch_size)) {
+        return false;
+    }
+    result = n;
+    return true;
+}
+
+bool audio_tokens_serialize(uint8_t * buf, size_t buf_size, size_t & offset,
+                             const mtmd_audio_tokens & audio, uint32_t version) {
+    if (!write_scalar<uint32_t>(buf, buf_size, offset, audio.n_tokens))            return false;
+    const uint64_t id_len = audio.id.size();
+    if (!write_scalar<uint64_t>(buf, buf_size, offset, id_len))                    return false;
+    if (id_len > 0) {
+        if (!write_bytes(buf, buf_size, offset, audio.id.data(), id_len))          return false;
+    }
+    return batch_f32_serialize(buf, buf_size, offset, audio.batch_f32, version);
+}
+
+bool audio_tokens_deserialize(const uint8_t * buf, size_t buf_size, size_t & offset,
+                               mtmd_audio_tokens & out, uint32_t version) {
+    uint32_t n_tokens = 0;
+    uint64_t id_len = 0;
+    if (!read_scalar<uint32_t>(buf, buf_size, offset, n_tokens)) return false;
+    if (!read_scalar<uint64_t>(buf, buf_size, offset, id_len))   return false;
+
+    if (id_len > buf_size - offset) return false;
+
+    out.n_tokens = n_tokens;
+    out.id.resize(id_len);
+    if (id_len > 0) {
+        if (!read_bytes(buf, buf_size, offset, out.id.data(), id_len)) return false;
+    }
+    return batch_f32_deserialize(buf, buf_size, offset, out.batch_f32, version) &&
+        out.batch_f32.is_audio;
+}
+
+} // anonymous namespace
+
+size_t mtmd_input_chunk_serialized_size_version(const mtmd_input_chunk * chunk, uint32_t version) {
+    if (!chunk || !serialization_version_writable(version)) return 0;
+    const bool shape_valid =
+        (chunk->type == MTMD_INPUT_CHUNK_TYPE_TEXT &&
+            !chunk->tokens_image && !chunk->tokens_audio) ||
+        (chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE &&
+            chunk->tokens_text.empty() && chunk->tokens_image && !chunk->tokens_audio &&
+            !chunk->tokens_image->batch_f32.is_audio) ||
+        (chunk->type == MTMD_INPUT_CHUNK_TYPE_AUDIO &&
+            chunk->tokens_text.empty() && !chunk->tokens_image && chunk->tokens_audio &&
+            chunk->tokens_audio->batch_f32.is_audio);
+    if (!shape_valid) {
+        return 0;
+    }
+    size_t n = sizeof(uint32_t) + 2 * sizeof(uint8_t) + sizeof(uint64_t);
+    size_t text_bytes = 0;
+    if (!checked_mul(chunk->tokens_text.size(), sizeof(llama_token), text_bytes) ||
+        !checked_add(n, text_bytes)) {
+        return 0;
+    }
+    if (chunk->tokens_image) {
+        size_t image_size = 0;
+        if (!image_tokens_serialized_size(*chunk->tokens_image, image_size, version) ||
+            !checked_add(n, image_size)) {
+            return 0;
+        }
+    }
+    if (chunk->tokens_audio) {
+        size_t audio_size = 0;
+        if (!audio_tokens_serialized_size(*chunk->tokens_audio, audio_size, version) ||
+            !checked_add(n, audio_size)) {
+            return 0;
+        }
+    }
+    return n;
+}
+
+size_t mtmd_input_chunk_serialized_size(const mtmd_input_chunk * chunk) {
+    return mtmd_input_chunk_serialized_size_version(
+        chunk, MTMD_INPUT_CHUNK_SERIALIZATION_VERSION);
+}
+
+size_t mtmd_input_chunk_serialize_version(
+        const mtmd_input_chunk * chunk, uint8_t * buf, size_t buf_size, uint32_t version) {
+    if (!chunk || !buf || !serialization_version_writable(version)) return 0;
+    const size_t need = mtmd_input_chunk_serialized_size_version(chunk, version);
+    if (buf_size < need) return 0;
+
+    size_t offset = 0;
+    if (!write_scalar<uint32_t>(buf, buf_size, offset, (uint32_t) chunk->type))     return 0;
+    const uint8_t has_image = chunk->tokens_image ? 1 : 0;
+    const uint8_t has_audio = chunk->tokens_audio ? 1 : 0;
+    if (!write_scalar<uint8_t >(buf, buf_size, offset, has_image))                  return 0;
+    if (!write_scalar<uint8_t >(buf, buf_size, offset, has_audio))                  return 0;
+
+    const uint64_t n_text = chunk->tokens_text.size();
+    if (!write_scalar<uint64_t>(buf, buf_size, offset, n_text))                     return 0;
+    if (n_text > 0) {
+        if (!write_bytes(buf, buf_size, offset,
+                          chunk->tokens_text.data(),
+                          n_text * sizeof(llama_token))) {
+            return 0;
+        }
+    }
+
+    if (chunk->tokens_image) {
+        if (!image_tokens_serialize(buf, buf_size, offset, *chunk->tokens_image, version)) return 0;
+    }
+    if (chunk->tokens_audio) {
+        if (!audio_tokens_serialize(buf, buf_size, offset, *chunk->tokens_audio, version)) return 0;
+    }
+    return offset;
+}
+
+size_t mtmd_input_chunk_serialize(
+        const mtmd_input_chunk * chunk, uint8_t * buf, size_t buf_size) {
+    return mtmd_input_chunk_serialize_version(
+        chunk, buf, buf_size, MTMD_INPUT_CHUNK_SERIALIZATION_VERSION);
+}
+
+mtmd_input_chunk * mtmd_input_chunk_deserialize_version(
+        const uint8_t * buf, size_t buf_size, size_t * bytes_read, uint32_t version) {
+    if (bytes_read) {
+        *bytes_read = 0;
+    }
+    if (!buf || !serialization_version_readable(version)) {
+        return nullptr;
+    }
+
+    try {
+        size_t offset = 0;
+
+        uint32_t type_u32 = 0;
+        uint8_t has_image = 0;
+        uint8_t has_audio = 0;
+        uint64_t n_text = 0;
+        if (!read_scalar<uint32_t>(buf, buf_size, offset, type_u32))  return nullptr;
+        if (!read_scalar<uint8_t>(buf, buf_size, offset, has_image))  return nullptr;
+        if (!read_scalar<uint8_t>(buf, buf_size, offset, has_audio))  return nullptr;
+        if (!read_scalar<uint64_t>(buf, buf_size, offset, n_text))    return nullptr;
+
+        if (type_u32 > MTMD_INPUT_CHUNK_TYPE_AUDIO || has_image > 1 || has_audio > 1) {
+            return nullptr;
+        }
+        const auto type = static_cast<mtmd_input_chunk_type>(type_u32);
+        const bool shape_valid =
+            (type == MTMD_INPUT_CHUNK_TYPE_TEXT  && !has_image && !has_audio) ||
+            (type == MTMD_INPUT_CHUNK_TYPE_IMAGE &&  has_image && !has_audio && n_text == 0) ||
+            (type == MTMD_INPUT_CHUNK_TYPE_AUDIO && !has_image &&  has_audio && n_text == 0);
+        if (!shape_valid || n_text > (buf_size - offset) / sizeof(llama_token)) {
+            return nullptr;
+        }
+
+        auto chunk = std::unique_ptr<mtmd_input_chunk>(new mtmd_input_chunk{
+            type,
+            {},
+            nullptr,
+            nullptr,
+        });
+
+        if (n_text > 0) {
+            chunk->tokens_text.resize(static_cast<size_t>(n_text));
+            size_t text_bytes = 0;
+            if (!checked_mul(static_cast<size_t>(n_text), sizeof(llama_token), text_bytes) ||
+                !read_bytes(buf, buf_size, offset, chunk->tokens_text.data(), text_bytes)) {
+                return nullptr;
+            }
+        }
+
+        if (has_image) {
+            chunk->tokens_image = mtmd_image_tokens_ptr(new mtmd_image_tokens());
+            if (!image_tokens_deserialize(buf, buf_size, offset, *chunk->tokens_image, version)) {
+                return nullptr;
+            }
+        }
+        if (has_audio) {
+            chunk->tokens_audio = mtmd_audio_tokens_ptr(new mtmd_audio_tokens());
+            if (!audio_tokens_deserialize(buf, buf_size, offset, *chunk->tokens_audio, version)) {
+                return nullptr;
+            }
+        }
+
+        if (bytes_read) {
+            *bytes_read = offset;
+        }
+        return chunk.release();
+    } catch (const std::exception &) {
+        return nullptr;
+    }
+}
+
+mtmd_input_chunk * mtmd_input_chunk_deserialize(
+        const uint8_t * buf, size_t buf_size, size_t * bytes_read) {
+    return mtmd_input_chunk_deserialize_version(
+        buf, buf_size, bytes_read, MTMD_INPUT_CHUNK_SERIALIZATION_VERSION);
+}
+
 // mtmd_image_tokens
 
 size_t mtmd_image_tokens_get_n_tokens(const mtmd_image_tokens * image_tokens) {
@@ -2407,7 +2859,8 @@ mtmd_input_chunks * mtmd_test_create_input_chunks() {
     mtmd_image_tokens_ptr image_tokens(new mtmd_image_tokens);
     image_tokens->nx = 4;
     image_tokens->ny = 4;
-    image_tokens->batch_f32.entries.resize(16);
+    image_tokens->batch_f32.entries.emplace_back();
+    image_tokens->batch_f32.entries.back().set_size({4, 4}, true, false);
     image_tokens->id = "image_1";
     mtmd_input_chunk chunk_image{
         MTMD_INPUT_CHUNK_TYPE_IMAGE,
@@ -2416,6 +2869,21 @@ mtmd_input_chunks * mtmd_test_create_input_chunks() {
         nullptr, // audio tokens
     };
     chunks->entries.emplace_back(std::move(chunk_image));
+
+    // create an audio chunk
+    mtmd_audio_tokens_ptr audio_tokens(new mtmd_audio_tokens);
+    audio_tokens->n_tokens = 8;
+    audio_tokens->batch_f32.is_audio = true;
+    audio_tokens->batch_f32.entries.emplace_back();
+    audio_tokens->batch_f32.entries.back().set_size({8, 1}, true, true);
+    audio_tokens->id = "audio_1";
+    mtmd_input_chunk chunk_audio{
+        MTMD_INPUT_CHUNK_TYPE_AUDIO,
+        {}, // text tokens
+        nullptr, // image tokens
+        std::move(audio_tokens),
+    };
+    chunks->entries.emplace_back(std::move(chunk_audio));
 
     return chunks;
 }
