@@ -17,6 +17,8 @@ add_library(${TARGET} STATIC
     server-context.h
     server-tools.cpp
     server-tools.h
+    sha256.c
+    sha256.h
 )
 
 if (BUILD_SHARED_LIBS)
@@ -26,6 +28,14 @@ endif()
 target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
+
+if (LLAMA_BUILD_TESTS)
+    add_executable(test-mtmd-sidecar ../../tests/test-mtmd-sidecar.cpp)
+    target_include_directories(test-mtmd-sidecar PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ../mtmd)
+    target_link_libraries(test-mtmd-sidecar PRIVATE server-context)
+    add_test(NAME test-mtmd-sidecar COMMAND $<TARGET_FILE:test-mtmd-sidecar>)
+    set_property(TEST test-mtmd-sidecar PROPERTY LABELS "main")
+endif()
 
 # llama-server-impl: server logic, reusable by app
 
