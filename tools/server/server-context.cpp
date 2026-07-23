@@ -20,11 +20,18 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cstring>
 #include <exception>
+#include <fstream>
 #include <memory>
 #include <filesystem>
 #include <utility>
-#include <fstream>
+#include <unordered_map>
+
+// SAIVerse fork extension: SHA-256 for mmproj fingerprint
+extern "C" {
+#include "sha256.h"
+}
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -896,6 +903,56 @@ struct server_metrics {
 
 
 //
+// SAIVerse fork extension: helper for mmproj fingerprint (SHA-256)
+//
+
+namespace {
+
+// Compute SHA-256 of a file. Returns 32-byte digest on success, empty vector on error.
+std::vector<uint8_t> compute_file_sha256(const std::string & filepath) {
+    std::ifstream in(filepath, std::ios::binary);
+    if (!in.is_open()) {
+        SRV_ERR("compute_file_sha256: failed to open %s\n", filepath.c_str());
+        return {};
+    }
+
+    sha256_t sha;
+    sha256_init(&sha);
+    std::vector<char> buf(64 * 1024);
+    while (in) {
+        in.read(buf.data(), buf.size());
+        const std::streamsize n = in.gcount();
+        if (n > 0) {
+            sha256_update(&sha, reinterpret_cast<const unsigned char *>(buf.data()),
+                          static_cast<size_t>(n));
+        }
+    }
+
+    if (in.bad()) {
+        SRV_ERR("compute_file_sha256: read error on %s\n", filepath.c_str());
+        return {};
+    }
+
+    std::vector<uint8_t> digest(SHA256_DIGEST_SIZE);
+    sha256_final(&sha, digest.data());
+    return digest;
+}
+
+std::string hex_of(const std::vector<uint8_t> & bytes) {
+    static const char * hex = "0123456789abcdef";
+    std::string out;
+    out.reserve(bytes.size() * 2);
+    for (uint8_t b : bytes) {
+        out.push_back(hex[b >> 4]);
+        out.push_back(hex[b & 0xf]);
+    }
+    return out;
+}
+
+} // anonymous namespace
+
+
+//
 // server_context_impl (private implementation)
 //
 
@@ -936,6 +993,10 @@ private:
     // use server_context methods instead
 
     common_params params_base;
+
+    // SAIVerse fork extension: SHA-256 of the loaded mmproj file.
+    // Empty when no mmproj is loaded. Used by slot save/restore to verify cache compatibility.
+    std::vector<uint8_t> mmproj_hash;
 
     // note: keep these alive - they determine the lifetime of the model, context, etc.
     common_init_result_ptr llama_init;
@@ -1264,6 +1325,16 @@ private:
                 return false;
             }
             SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
+
+            // SAIVerse fork extension: compute SHA-256 of mmproj file for slot save/restore compatibility check.
+            // If hashing fails, log a warning but continue - slot save/restore will be unavailable.
+            mmproj_hash = compute_file_sha256(mmproj_path);
+            if (mmproj_hash.empty()) {
+                SRV_WRN("failed to compute SHA-256 of mmproj '%s'; "
+                        "multimodal slot save/restore will be disabled\n", mmproj_path.c_str());
+            } else {
+                SRV_INF("mmproj SHA-256: %s\n", hex_of(mmproj_hash).c_str());
+            }
 
             if (params_base.ctx_shift) {
                 params_base.ctx_shift = false;
@@ -2093,17 +2164,10 @@ private:
         queue_results.send(std::move(res));
     }
 
-    // Gate slot save/restore/erase on slot content (does it hold media),
-    // not model capability: a multimodal model may hold a pure-text slot.
-    bool check_slot_no_media(const server_slot & slot, const int id_task) {
-        if (slot.prompt.tokens.has_media()) {
-            send_error(id_task,
-                "This operation is not supported while the slot holds image/audio tokens (a pure-text prefix is supported)",
-                ERROR_TYPE_NOT_SUPPORTED);
-            return false;
-        }
-        return true;
-    }
+    // SAIVerse fork: removed check_slot_no_media() (upstream's successor to check_no_mtmd()).
+    // Upstream rejects slot save/restore/erase whenever the slot holds image/audio tokens;
+    // this fork supports exactly that case through the .mtmd sidecar mechanism
+    // (see server_tokens::save/load_mtmd_sidecar), so the gate is removed at every call site.
 
     void send_partial_response(server_slot & slot, const completion_token_output & tkn, bool is_progress, bool is_begin = false) {
         auto res = std::make_unique<server_task_result_cmpl_partial>();
@@ -2682,9 +2746,6 @@ private:
                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
-                    if (!check_slot_no_media(*slot, task.id)) {
-                        break;
-                    }
                     if (slot->is_processing()) {
                         // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
@@ -2696,10 +2757,43 @@ private:
 
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
+                    const std::string mtmd_filepath = filepath + ".mtmd";
+                    const bool has_media = slot->prompt.tokens.has_media();
+
+                    if (has_media && (!mctx || mmproj_hash.empty())) {
+                        send_error(task, "mmproj fingerprint not available; "
+                                          "cannot save slot with multimodal data",
+                                   ERROR_TYPE_SERVER);
+                        break;
+                    }
 
                     const llama_tokens tokens = slot->prompt.tokens.get_text_tokens();
                     const size_t token_count = tokens.size();
                     const size_t nwrite = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), token_count);
+
+                    // SAIVerse fork extension: save mtmd sidecar if multimodal media chunks exist
+                    size_t nwrite_mtmd = 0;
+                    if (has_media) {
+                        nwrite_mtmd = slot->prompt.tokens.save_mtmd_sidecar(mtmd_filepath, mmproj_hash);
+                        if (nwrite_mtmd == 0) {
+                            std::error_code remove_ec;
+                            std::filesystem::remove(mtmd_filepath, remove_ec);
+                            send_error(task, "Failed to save mtmd sidecar file",
+                                       ERROR_TYPE_SERVER);
+                            break;
+                        }
+                    } else {
+                        std::error_code remove_ec;
+                        const bool removed = std::filesystem::remove(mtmd_filepath, remove_ec);
+                        if (remove_ec) {
+                            send_error(task, "Failed to remove stale mtmd sidecar file",
+                                       ERROR_TYPE_SERVER);
+                            break;
+                        }
+                        if (removed) {
+                            SLT_INF(*slot, "removed stale mtmd sidecar %s\n", mtmd_filepath.c_str());
+                        }
+                    }
 
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
@@ -2720,7 +2814,7 @@ private:
                     res->filename = filename;
                     res->is_save  = true;
                     res->n_tokens = token_count;
-                    res->n_bytes  = nwrite;
+                    res->n_bytes  = nwrite + nwrite_mtmd;
                     res->t_ms     = t_save_ms;
                     queue_results.send(std::move(res));
                 } break;
@@ -2743,26 +2837,73 @@ private:
 
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
+                    const std::string mtmd_filepath = filepath + ".mtmd";
+                    std::error_code sidecar_ec;
+                    const bool has_mtmd_sidecar = std::filesystem::exists(mtmd_filepath, sidecar_ec);
+
+                    if (sidecar_ec) {
+                        send_error(task, "Unable to inspect mtmd sidecar file",
+                                   ERROR_TYPE_SERVER);
+                        break;
+                    }
+
+                    if (has_mtmd_sidecar && !mctx) {
+                        send_error(task,
+                            "Cannot restore multimodal cache without mmproj; "
+                            "start the server with --mmproj to use this cache file",
+                            ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (has_mtmd_sidecar && mmproj_hash.empty()) {
+                        send_error(task,
+                            "mmproj fingerprint not available; cannot verify cache compatibility",
+                            ERROR_TYPE_SERVER);
+                        break;
+                    }
 
                     llama_tokens tokens;
                     tokens.resize(slot->n_ctx);
                     size_t token_count = 0;
+                    slot->prompt.checkpoints.clear();
                     size_t nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), tokens.size(), &token_count);
                     if (nread == 0) {
-                        slot->prompt.clear(); // KV may already been invalidated?
+                        slot->prompt_clear(); // KV may already been invalidated?
                         send_error(task, "Unable to restore slot, no available space in KV cache or invalid slot save file", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
                     tokens.resize(token_count);
+                    if (!has_mtmd_sidecar &&
+                        std::find(tokens.begin(), tokens.end(), LLAMA_TOKEN_NULL) != tokens.end()) {
+                        slot->prompt_clear();
+                        send_error(task,
+                            "Cannot restore multimodal cache because its mtmd sidecar is missing",
+                            ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
                     slot->prompt.clear();
                     slot->prompt.tokens.insert(tokens);
 
-                    // reload the context checkpoints written at save time; without them the
-                    // next request's rollback finds no usable cache data and forces a full
-                    // re-prefill ("forcing full prompt re-processing due to lack of cache
-                    // data"). if no sidecar exists (state saved by an older build), fall back
-                    // to synthesizing a tip checkpoint from the just-restored state, which at
-                    // least covers exact continuations.
+                    // Restore media metadata before checkpoints so the prompt token
+                    // graph is complete before any checkpoint fallback is synthesized.
+                    size_t nread_mtmd = 0;
+                    if (has_mtmd_sidecar) {
+                        if (!slot->prompt.tokens.load_mtmd_sidecar(mtmd_filepath, mmproj_hash)) {
+                            slot->prompt_clear();
+                            send_error(task,
+                                "Failed to load mtmd sidecar (mmproj mismatch, version mismatch, or corrupt file)",
+                                ERROR_TYPE_INVALID_REQUEST);
+                            break;
+                        }
+                        // record bytes read for response
+                        std::error_code ec;
+                        const auto sz = std::filesystem::file_size(mtmd_filepath, ec);
+                        if (!ec) {
+                            nread_mtmd = static_cast<size_t>(sz);
+                        }
+                    }
+
+                    // Checkpoints are a separate sidecar used for SWA and recurrent
+                    // rollback. Keep them alongside the multimodal metadata.
                     if (params_base.n_ctx_checkpoints > 0 && token_count > 0) {
                         if (checkpoints_load_sidecar(slot->prompt.checkpoints, filepath + ".ckpt")) {
                             SLT_INF(*slot, "restored %zu context checkpoints from sidecar\n", slot->prompt.checkpoints.size());
@@ -2784,20 +2925,19 @@ private:
                     res->filename = filename;
                     res->is_save  = false;
                     res->n_tokens = token_count;
-                    res->n_bytes  = nread;
+                    res->n_bytes  = nread + nread_mtmd;
                     res->t_ms     = t_restore_ms;
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SLOT_ERASE:
                 {
+                    // SAIVerse fork: media gate removed here too.
+                    // SLOT_ERASE only clears in-memory KV state and never touches sidecar files
+                    // (matching the existing behavior where the on-disk .bin is also not deleted).
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
-                        break;
-                    }
-                    // Gate on slot content, consistent with save/restore.
-                    if (!check_slot_no_media(*slot, task.id)) {
                         break;
                     }
                     if (slot->is_processing()) {
@@ -3615,8 +3755,6 @@ private:
                             ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
                             n_swa > 0);
 
-                    bool has_mtmd = false;
-
                     // check if we should process the image
                     while (true) {
                         auto cur_token_idx = slot.prompt.n_tokens();
@@ -3645,7 +3783,6 @@ private:
                             slot.prompt.tokens.push_back(chunk.get()); // copy
                         }
 
-                        has_mtmd = true;
                     }
 
                     const auto & spans = slot.task->params.message_spans;
@@ -3754,14 +3891,20 @@ private:
                         do_checkpoint = false;
                     }
 
-                    // do not checkpoint after mtmd chunks
-                    do_checkpoint = do_checkpoint && !has_mtmd;
+                    // Media chunks are decoded before the checkpoint is captured. Keep a
+                    // post-media checkpoint so SWA/recurrent models can restore the image
+                    // state instead of encoding the media again.
+                    const bool has_media_prompt = slot.prompt.tokens.has_media();
 
-                    // no need to create checkpoints that are too close together, unless it's the last user message
+                    // no need to create checkpoints that are too close together, unless it's the last user message.
+                    // Media may occupy hundreds of positions while using only one logical
+                    // token, so logical token spacing must not suppress its checkpoint.
                     do_checkpoint = do_checkpoint && (
+                            has_media_prompt ||
                             slot.prompt.checkpoints.empty() ||
                             is_last_user_message || near_prompt_end ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not

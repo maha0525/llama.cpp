@@ -232,6 +232,44 @@ MTMD_API llama_pos                  mtmd_input_chunk_get_n_pos       (const mtmd
 MTMD_API mtmd_input_chunk * mtmd_input_chunk_copy(const mtmd_input_chunk * chunk);
 MTMD_API void               mtmd_input_chunk_free(mtmd_input_chunk * chunk);
 
+// SAIVerse fork extension: serialize / deserialize mtmd_input_chunk to a byte buffer.
+// Used by the server slot save/restore API to persist multimodal KV cache sidecar files.
+// Format is private to this fork; no API/ABI stability is guaranteed.
+//
+// Versions 2..4 can be read. Only 2 and 4 can be written: version 3 embedded
+// clip_image_f32_batch::grid_x / grid_y, and upstream has since removed those
+// fields from the struct (llava-uhd style models compute the grid locally), so
+// this build has no truthful value to write there. Sidecar files written by
+// earlier fork builds are still loadable — their grid fields are read and
+// discarded.
+#define MTMD_INPUT_CHUNK_SERIALIZATION_VERSION 4
+//
+// Usage (serialize):
+//   size_t need = mtmd_input_chunk_serialized_size(chunk);
+//   std::vector<uint8_t> buf(need);
+//   size_t wrote = mtmd_input_chunk_serialize(chunk, buf.data(), buf.size());
+//   // wrote == need on success, 0 on failure
+//
+// Usage (deserialize):
+//   size_t bytes_read = 0;
+//   mtmd_input_chunk * chunk = mtmd_input_chunk_deserialize(buf.data(), buf.size(), &bytes_read);
+//   // chunk == nullptr on failure; on success, caller must mtmd_input_chunk_free(chunk)
+MTMD_API size_t              mtmd_input_chunk_serialized_size(const mtmd_input_chunk * chunk);
+MTMD_API size_t              mtmd_input_chunk_serialize      (const mtmd_input_chunk * chunk,
+                                                              uint8_t * buf, size_t buf_size);
+MTMD_API size_t              mtmd_input_chunk_serialized_size_version(
+                                                              const mtmd_input_chunk * chunk,
+                                                              uint32_t version);
+MTMD_API size_t              mtmd_input_chunk_serialize_version(
+                                                              const mtmd_input_chunk * chunk,
+                                                              uint8_t * buf, size_t buf_size,
+                                                              uint32_t version);
+MTMD_API mtmd_input_chunk *  mtmd_input_chunk_deserialize    (const uint8_t * buf, size_t buf_size,
+                                                              size_t * bytes_read);
+MTMD_API mtmd_input_chunk *  mtmd_input_chunk_deserialize_version(
+                                                              const uint8_t * buf, size_t buf_size,
+                                                              size_t * bytes_read, uint32_t version);
+
 
 // mtmd_image_tokens
 //

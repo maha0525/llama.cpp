@@ -234,6 +234,23 @@ public:
     bool validate(const struct llama_context * ctx) const;
 
     server_tokens clone() const;
+
+    // SAIVerse fork extension: multimodal slot save/restore sidecar
+    //
+    // Whether a .mtmd sidecar has to be written alongside the KV cache file is
+    // decided by has_media() above.
+
+    // Save map_idx_to_media + per-chunk metadata to a sidecar file.
+    // 'mmproj_hash' (32 bytes SHA-256) is embedded for compatibility verification on load.
+    // Returns number of bytes written (0 on failure).
+    size_t save_mtmd_sidecar(const std::string & filepath,
+                              const std::vector<uint8_t> & mmproj_hash) const;
+
+    // Restore map_idx_to_media from a sidecar file.
+    // 'expected_mmproj_hash' is compared against the hash embedded in the file; mismatch returns false.
+    // Returns true on success. On failure, this server_tokens is not modified.
+    bool load_mtmd_sidecar(const std::string & filepath,
+                            const std::vector<uint8_t> & expected_mmproj_hash);
 };
 
 
