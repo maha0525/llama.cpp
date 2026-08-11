@@ -19,7 +19,19 @@ extern "C" {
 // the two happen to unify is a property of the platform's symbol resolution
 // (ELF interposition may merge them; two-level-namespace and DLL targets will
 // not), which made the group-size propagation silently link-order dependent.
-GGML_API int turbo3_cpu_wht_group_size;
+//
+// SAIVerse fork patch: GGML_API cannot be used here. It already expands to a
+// form containing `extern` on every path except the non-Windows shared one, so
+// `GGML_API extern` is a duplicate storage class on MSVC (C2159), while plain
+// `GGML_API` reintroduces the second definition on ELF. ggml-cpu is a separate
+// shared object from ggml-base, so Windows additionally needs the import
+// decoration that GGML_API cannot supply here (GGML_BUILD is defined only for
+// the ggml-base and ggml targets, never for ggml-cpu).
+#if defined(GGML_SHARED) && defined(_WIN32) && !defined(__MINGW32__)
+__declspec(dllimport) extern int turbo3_cpu_wht_group_size;
+#else
+extern int turbo3_cpu_wht_group_size;
+#endif
 }
 
 // ggml_compute_forward_dup
