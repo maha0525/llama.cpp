@@ -70,7 +70,8 @@ jobs:
         id: matrices
         shell: bash
         env:
-          SKIP_S390X: ${{ inputs.skip_s390x || 'false' }}
+          # Scheduled runs have no IBM Z runner; manual runs can still include s390x.
+          SKIP_S390X: ${{ github.event_name == 'schedule' || inputs.skip_s390x || 'false' }}
         run: |
           set -euo pipefail
 

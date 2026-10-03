@@ -444,13 +444,26 @@ struct server_slot {
 
     server_prompt prompt;
 
+    // Set once a context reports that it cannot serialize its KV cache, so the failure is
+    // logged one time instead of on every request.
+    mutable bool state_save_unsupported = false;
+
     bool prompt_save(server_prompt_cache & prompt_cache) const {
-        if (prompt.tokens.size() == 0) {
+        if (prompt.tokens.size() == 0 || state_save_unsupported) {
             return false;
         }
 
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+
+        // A context that cannot serialize its KV cache (block KV streaming, for one) reports
+        // size zero. Saving an empty entry would spend a cache slot on something prompt_load
+        // can never restore, and would repeat the failure on every request.
+        if (cur_size_tgt == 0) {
+            SRV_WRN("%s", "prompt cache disabled: this context cannot save KV cache state\n");
+            state_save_unsupported = true;
+            return false;
+        }
 
         const size_t cur_size = cur_size_tgt + cur_size_dft;
 
@@ -1440,26 +1453,6 @@ private:
                             path_dft, &mparams_measure, &cparams_dft,
                             params_base.model.path.c_str(), &mparams_parent, &cparams_tgt,
                             measured_devs, measured_ngl, measured_nct, measured_nex, GGML_LOG_LEVEL_ERROR);
-                        if (!spec_mtp) {
-                            return data;
-                        }
-
-                        std::vector<ggml_backend_dev_t> target_devs;
-                        uint32_t target_ngl = 0;
-                        uint32_t target_nct = 0;
-                        uint32_t target_nex = 0;
-                        const auto target = common_get_device_memory_data(
-                            params_base.model.path.c_str(), &mparams_parent, &cparams_tgt,
-                            target_devs, target_ngl, target_nct, target_nex, GGML_LOG_LEVEL_ERROR);
-                        if (target_devs != measured_devs || target.size() != data.size()) {
-                            throw std::runtime_error("MTP and target memory devices differ");
-                        }
-                        for (size_t i = 0; i < data.size(); i++) {
-                            if (target[i].compute > SIZE_MAX - data[i].compute) {
-                                throw std::runtime_error("MTP memory estimate overflowed");
-                            }
-                            data[i].compute += target[i].compute;
-                        }
                         return data;
                     };
 
@@ -1780,14 +1773,25 @@ private:
         }
 
         if (params_base.cache_ram_mib != 0) {
-            if (params_base.cache_ram_mib < 0) {
-                SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
+            int32_t cache_ram_mib = params_base.cache_ram_mib;
+            if (cache_ram_mib < 0) {
+                // "no limit" must still be bounded by the machine: every cached prompt is a full copy of a
+                // sequence's KV state in host memory (14 GiB for a 220k-token f16 cache on a 27B model),
+                // and an unbounded cache swaps the box to death long before it helps anyone.
+                // Take half of what the host has free when the server starts.
+                size_t free_host = 0, total_host = 0;
+                if (auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
+                    ggml_backend_dev_memory(cpu_dev, &free_host, &total_host);
+                }
+                cache_ram_mib = free_host > 0 ? (int32_t) std::min<size_t>(free_host / 2 / (1024*1024), INT32_MAX) : 8192;
+                SRV_INF("prompt cache is enabled with no explicit limit, bounding it to %d MiB (half of the %.1f GiB of free host memory)\n",
+                        cache_ram_mib, free_host / (1024.0*1024.0*1024.0));
             } else {
-                SRV_TRC("prompt cache is enabled, size limit: %d MiB\n", params_base.cache_ram_mib);
+                SRV_INF("prompt cache is enabled, size limit: %d MiB\n", cache_ram_mib);
             }
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            prompt_cache = std::make_unique<server_prompt_cache>(cache_ram_mib, n_ctx);
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
@@ -2818,7 +2822,8 @@ private:
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
-        const int id_task = slot.task->id;
+        // Slot restore can synthesize a checkpoint without an active inference task.
+        const int id_task = slot.task ? slot.task->id : -1;
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
@@ -3068,9 +3073,21 @@ private:
                         break;
                     }
 
-                    const llama_tokens tokens = slot->prompt.tokens.get_text_tokens();
+                    // Check before opening the file: unsupported contexts must not truncate an existing save.
+                    if (llama_state_seq_get_size_ext(ctx_tgt, slot->id, LLAMA_STATE_SEQ_FLAGS_NONE) == 0) {
+                        send_error(task, "Unable to save slot: this context cannot serialize its state",
+                                   ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+
+                    // Keep media placeholders so the state file and mtmd sidecar use the same token indices.
+                    const llama_tokens & tokens = slot->prompt.tokens.get_tokens();
                     const size_t token_count = tokens.size();
                     const size_t nwrite = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), token_count);
+                    if (nwrite == 0) {
+                        send_error(task, "Unable to save slot state file", ERROR_TYPE_SERVER);
+                        break;
+                    }
 
                     // SAIVerse fork extension: save mtmd sidecar if multimodal media chunks exist
                     size_t nwrite_mtmd = 0;

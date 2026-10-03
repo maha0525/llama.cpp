@@ -14,6 +14,7 @@ struct llama_cparams {
     uint32_t n_ubatch;
     uint32_t n_seq_max;
     uint32_t n_rs_seq;        // number of recurrent-state snapshots per seq for rollback
+    bool     gdn_replay;      // DRC: ingredient-replay rollback instead of full K-snapshots (opt-in)
     uint32_t n_outputs_max;   // max outputs supported by the context
     int32_t  n_threads;       // number of threads to use for generation
     int32_t  n_threads_batch; // number of threads to use for batch processing
@@ -56,6 +57,8 @@ struct llama_cparams {
     bool op_offload;
     bool kv_unified;
     bool pipeline_parallel;
+
+    uint32_t kv_stream_arena_mib;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 

@@ -43,10 +43,10 @@
 #define LLAMA_FILE_MAGIC_GGSQ 0x67677371u // 'ggsq'
 
 #define LLAMA_SESSION_MAGIC   LLAMA_FILE_MAGIC_GGSN
-#define LLAMA_SESSION_VERSION 9
+#define LLAMA_SESSION_VERSION 10
 
 #define LLAMA_STATE_SEQ_MAGIC   LLAMA_FILE_MAGIC_GGSQ
-#define LLAMA_STATE_SEQ_VERSION 2
+#define LLAMA_STATE_SEQ_VERSION 3
 
 #ifdef __cplusplus
 extern "C" {
@@ -156,8 +156,11 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q1_0          = 40, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q2_0          = 41, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_Q8_CR         = 42, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_TQ3_1S        = 43, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_TQ4_1S        = 44, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_Q5_CR         = 45, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_Q6_CR         = 46, // except 1d tensors
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
@@ -205,7 +208,8 @@ extern "C" {
     };
 
     enum llama_load_mode {
-        LLAMA_LOAD_MODE_NONE       = 0, // no special loading mode
+        LLAMA_LOAD_MODE_AUTO       = -1, // auto-detect based on device capabilities
+        LLAMA_LOAD_MODE_NONE       =  0, // no special loading mode
         LLAMA_LOAD_MODE_MMAP       = 1, // memory map the model
         LLAMA_LOAD_MODE_MLOCK      = 2, // force system to keep model in RAM rather than swapping or compressing
         LLAMA_LOAD_MODE_MMAP_MLOCK = 3, // mmap + force system to keep model in RAM rather than swapping or compressing
@@ -214,6 +218,12 @@ extern "C" {
 
     LLAMA_API const char * llama_load_mode_name(enum llama_load_mode load_mode);
     LLAMA_API enum llama_load_mode llama_load_mode_from_str(const char * str);
+
+    enum llama_tensor_read_lazy {
+        LLAMA_TENSOR_READ_LAZY_OFF  = 0, // always read the whole tensor up front
+        LLAMA_TENSOR_READ_LAZY_AUTO = 1, // lazy only for marked tensors larger than 4 GiB (requires mmap)
+        LLAMA_TENSOR_READ_LAZY_ON   = 2, // read the rows of tensors marked by the arch on demand (requires mmap)
+    };
 
     enum llama_context_type {
         LLAMA_CONTEXT_TYPE_DEFAULT = 0,
@@ -323,6 +333,8 @@ extern "C" {
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
         enum llama_load_mode  load_mode;  // how to load the model
 
+        enum llama_tensor_read_lazy tensor_read_lazy; // on-demand reading of tensors marked by the arch
+
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
 
@@ -362,6 +374,7 @@ extern "C" {
         uint32_t n_ubatch;          // physical maximum batch size
         uint32_t n_seq_max;         // max number of sequences (i.e. distinct states for recurrent models)
         uint32_t n_rs_seq;          // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
+        bool     gdn_replay;        // ingredient-replay rollback instead of full K-snapshots when n_rs_seq > 0 [EXPERIMENTAL]
         uint32_t n_outputs_max;     // max outputs in a ubatch (0 = n_batch)
         int32_t  n_threads;         // number of threads to use for generation
         int32_t  n_threads_batch;   // number of threads to use for batch processing
@@ -418,6 +431,14 @@ extern "C" {
         // a source/target/parent context
         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
         struct llama_context * ctx_other;
+
+        // [EXPERIMENTAL] block-granular KV cache streaming: total shared CUDA
+        // arena (compute workspace + resident KV pages + transfer ring), in
+        // MiB. 0 disables streaming.
+        // Appended here (not with the other [EXPERIMENTAL] fields above) so
+        // a caller built against a pre-streaming header keeps the same
+        // offsets for every field before it.
+        uint32_t kv_stream_arena_mib;
     };
 
     struct llama_model_tensor_override {
@@ -1001,6 +1022,19 @@ extern "C" {
     LLAMA_API int32_t llama_decode(
             struct llama_context * ctx,
               struct llama_batch   batch);
+
+    // Describes the role of subsequent llama_decode() batches for
+    // phase-specialized memory allocators. It does not change model math.
+    enum llama_decode_phase {
+        LLAMA_DECODE_PHASE_AUTOMATIC  = 0,
+        LLAMA_DECODE_PHASE_PROMPT     = 1,
+        LLAMA_DECODE_PHASE_GENERATION = 2,
+    };
+
+    // The selected phase remains active until changed. AUTOMATIC preserves
+    // the traditional token-count heuristic for callers without phase state.
+    LLAMA_API void llama_set_decode_phase(
+        struct llama_context * ctx, enum llama_decode_phase phase);
 
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)

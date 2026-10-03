@@ -2,6 +2,7 @@ import pytest
 from utils import *
 import base64
 import requests
+from pathlib import Path
 
 server = ServerPreset.tinyllama2()
 
@@ -72,6 +73,24 @@ def test_slot_save_restore():
     assert res.body["timings"]["prompt_n"] == 1
 
 
+def test_slot_save_file_error():
+    server.start()
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "A short text prompt.", "id_slot": 1, "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    filename = "slot_save_directory.bin"
+    path = Path(server.slot_save_path) / filename
+    path.mkdir(exist_ok=True)
+    try:
+        res = server.make_request("POST", "/slots/1?action=save", data={"filename": filename})
+        assert res.status_code == 500
+        assert res.body["error"]["type"] == "server_error"
+        assert not Path(str(path) + ".mtmd").exists()
+    finally:
+        path.rmdir()
+
+
 def test_slot_erase():
     global server
     server.start()
@@ -106,8 +125,8 @@ def test_slot_erase():
 # Regression coverage for issue #21133: slot save/restore/erase must be gated on
 # the slot's CONTENT (does it actually hold image/audio tokens) rather than the
 # model's CAPABILITY (is an mmproj loaded). A pure-text slot on a multimodal
-# server must save/restore/erase normally; a slot that actually holds an image
-# must be rejected with ERROR_TYPE_NOT_SUPPORTED (HTTP 501).
+# server must save/restore/erase normally. Image slots persist their media
+# metadata in a sidecar and must also survive a fresh-server restore.
 #
 
 IMG_URL_CAT = "https://huggingface.co/ggml-org/tinygemma3-GGUF/resolve/main/test/91_cat.png"
@@ -171,30 +190,78 @@ def test_slot_save_restore_text_only_on_multimodal(mmproj_server):
     assert res.status_code == 200
 
 
-def test_slot_save_rejected_when_slot_holds_image(mmproj_server):
+def test_slot_save_restore_image(mmproj_server):
     server = mmproj_server
     server.start()
-
-    # Process a prompt that actually contains an image on slot 1.
-    res = server.make_request("POST", "/completions", data={
+    prompt = {
         "temperature": 0.0,
         "top_k": 1,
         "id_slot": 1,
         "cache_prompt": True,
         "prompt": {
             "prompt_string": "What is this: <__media__>\n",
-            "multimodal_data": [ _get_img_base64(IMG_URL_CAT) ],
+            "multimodal_data": [_get_img_base64(IMG_URL_CAT)],
         },
+    }
+    res = server.make_request("POST", "/completions", data=prompt)
+    assert res.status_code == 200
+    content = res.body["content"]
+    prompt_n = res.body["timings"]["prompt_n"]
+    filename = "mm_slot_image.bin"
+    sidecar = Path(server.slot_save_path) / (filename + ".mtmd")
+    checkpoint = Path(server.slot_save_path) / (filename + ".ckpt")
+
+    res = server.make_request("POST", "/slots/1?action=save", data={"filename": filename})
+    assert res.status_code == 200
+    saved = res.body["n_saved"]
+    assert saved > 0
+    assert sidecar.is_file()
+    media_data = sidecar.read_bytes()
+    assert server.make_request("POST", "/slots/1?action=erase").status_code == 200
+
+    # A new process must recover the saved tokens, media and checkpoints.
+    server.stop()
+    server.start()
+    res = server.make_request("POST", "/slots/1?action=restore", data={"filename": filename})
+    assert res.status_code == 200
+    assert res.body["n_restored"] == saved
+    res = server.make_request("POST", "/completions", data=prompt)
+    assert res.status_code == 200
+    assert res.body["content"] == content
+    assert res.body["timings"]["prompt_n"] < prompt_n
+
+    # A missing optional checkpoint sidecar can require prompt recomputation.
+    server.stop()
+    checkpoint.unlink(missing_ok=True)
+    server.start()
+    res = server.make_request("POST", "/slots/1?action=restore", data={"filename": filename})
+    assert res.status_code == 200
+    assert res.body["n_restored"] == saved
+    res = server.make_request("POST", "/completions", data=prompt)
+    assert res.status_code == 200
+    assert res.body["content"] == content
+
+    # Incomplete or corrupt saved media must be rejected without poisoning the slot.
+    for bad_data in (None, b"invalid sidecar"):
+        if bad_data is None:
+            sidecar.unlink()
+        else:
+            sidecar.write_bytes(bad_data)
+        res = server.make_request("POST", "/slots/1?action=restore", data={"filename": filename})
+        assert res.status_code == 400
+        res = server.make_request("POST", "/completions", data=prompt)
+        assert res.status_code == 200
+        sidecar.write_bytes(media_data)
+
+    # Reusing the filename for text must remove stale media metadata.
+    assert server.make_request("POST", "/slots/1?action=erase").status_code == 200
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "A short text prompt.", "id_slot": 1, "cache_prompt": True,
     })
     assert res.status_code == 200
-
-    # Saving a slot that holds image tokens must be rejected (HTTP 501,
-    # not_supported_error).
-    res = server.make_request("POST", "/slots/1?action=save", data={
-        "filename": "mm_slot_image.bin",
-    })
-    assert res.status_code != 200
-    assert res.body["error"]["type"] == "not_supported_error"
+    res = server.make_request("POST", "/slots/1?action=save", data={"filename": filename})
+    assert res.status_code == 200
+    assert not sidecar.exists()
 
 
 def test_slot_erase_text_only_on_multimodal(mmproj_server):

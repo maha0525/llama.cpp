@@ -1242,7 +1242,10 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
-    if (params.fit_params) {
+    if (params.fit_params && !common_params_should_fit_device_memory(params)) {
+        COM_INF("%s", "skipping device-memory auto-fit because a shared KV/compute arena is explicitly configured\n");
+    }
+    if (common_params_should_fit_device_memory(params)) {
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
         // Snapshot the pre-fit state so a failed fit can be rolled back to a
@@ -1653,6 +1656,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
     mparams.load_mode       = params.load_mode;
+    mparams.tensor_read_lazy = params.tensor_read_lazy;
     mparams.tensor_split    = params.tensor_split;
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
@@ -1688,6 +1692,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_seq_max         = params.n_parallel;
     cparams.n_outputs_max     = params.n_outputs_max;
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
+    cparams.gdn_replay        = params.gdn_replay;
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_batch           = params.n_batch;
     cparams.n_ubatch          = params.n_ubatch;
@@ -1723,6 +1728,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
+    cparams.kv_stream_arena_mib = params.kv_stream_arena_mib;
 
     if (params.moe_cache.mode_explicit) {
         switch (params.moe_cache.mode) {
@@ -1741,6 +1747,10 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.moe_cache_budget_mib = params.moe_cache.budget_mib;
 
     return cparams;
+}
+
+bool common_params_should_fit_device_memory(const common_params & params) {
+    return params.fit_params && params.kv_stream_arena_mib == 0;
 }
 
 struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const common_cpu_params & params) {
