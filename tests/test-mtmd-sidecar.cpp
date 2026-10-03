@@ -237,6 +237,13 @@ int main() {
     CHECK(restored.get_tokens() == source.get_tokens());
     check_media_equal(source, restored);
 
+    // The state file must keep media placeholders, just like the sidecar.
+    server_tokens text_only(source.get_text_tokens(), true);
+    CHECK(text_only.size() < source.size());
+    CHECK(!text_only.load_mtmd_sidecar(sidecar.path.string(), hash));
+    CHECK(!text_only.has_media());
+    CHECK(text_only.get_tokens() == source.get_text_tokens());
+
     std::vector<uint8_t> wrong_hash = hash;
     wrong_hash[0] ^= 0xff;
     server_tokens hash_rejected = source.clone();
