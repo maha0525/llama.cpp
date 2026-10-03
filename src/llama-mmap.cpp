@@ -376,7 +376,7 @@ struct llama_file::impl {
     ~impl() {
         if (fd != -1) {
             close(fd);
-        } else if (owns_fp) {
+        } else if (fp && owns_fp) {
             std::fclose(fp);
         }
     }
@@ -401,6 +401,17 @@ llama_file::llama_file(const char * fname, const char * mode, const bool use_dir
 llama_file::llama_file(FILE * file) : pimpl(std::make_unique<impl>(file)) {}
 
 llama_file::~llama_file() = default;
+
+void llama_file::close_checked() {
+    GGML_ASSERT(pimpl->fp && pimpl->owns_fp);
+    FILE * fp = pimpl->fp;
+    pimpl->fp = nullptr;
+    const bool flushed = std::fflush(fp) == 0;
+    const bool closed = std::fclose(fp) == 0;
+    if (!flushed || !closed) {
+        throw std::runtime_error("failed to flush or close file");
+    }
+}
 
 size_t llama_file::tell() const { return pimpl->tell(); }
 size_t llama_file::size() const { return pimpl->size; }
