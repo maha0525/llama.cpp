@@ -23,6 +23,8 @@ add_library(${TARGET} STATIC
     server-mcp.h
     server-schema.cpp
     server-schema.h
+    server-slot-save.cpp
+    server-slot-save.h
     sha256.c
     sha256.h
 )
@@ -34,8 +36,21 @@ endif()
 target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
+if (WIN32)
+    target_link_libraries(${TARGET} PRIVATE advapi32)
+endif()
 
 if (LLAMA_BUILD_TESTS)
+    add_executable(test-slot-save ../../tests/test-slot-save.cpp server-slot-save.cpp sha256.c)
+    target_compile_features(test-slot-save PRIVATE cxx_std_17)
+    target_include_directories(test-slot-save PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(test-slot-save PRIVATE ${CMAKE_THREAD_LIBS_INIT})
+    if (WIN32)
+        target_link_libraries(test-slot-save PRIVATE advapi32)
+    endif()
+    add_test(NAME test-slot-save COMMAND $<TARGET_FILE:test-slot-save>)
+    set_property(TEST test-slot-save PROPERTY LABELS "main")
+
     add_executable(test-mtmd-sidecar ../../tests/test-mtmd-sidecar.cpp)
     target_include_directories(test-mtmd-sidecar PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ../mtmd)
     target_link_libraries(test-mtmd-sidecar PRIVATE server-context)

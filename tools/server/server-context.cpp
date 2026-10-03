@@ -6,6 +6,7 @@
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "server-slot-save.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -2736,6 +2737,9 @@ private:
     // action=restore in a fresh process can roll back mid-prompt (e.g. after a
     // BPE boundary re-tokenization of the prompt tail) instead of re-prefilling.
     static bool checkpoints_save_sidecar(const std::list<common_prompt_checkpoint> & checkpoints, const std::string & filepath) {
+        if (checkpoints.size() > 1024) {
+            return false;
+        }
         FILE * f = fopen(filepath.c_str(), "wb");
         if (f == nullptr) {
             return false;
@@ -2767,17 +2771,25 @@ private:
             ok = ok && (n_dft == 0 || fwrite(cur.data_dft.data(), 1, n_dft, f) == n_dft);
         }
 
-        fclose(f);
-        return ok;
+        const bool flushed = fflush(f) == 0;
+        const bool closed = fclose(f) == 0;
+        return ok && flushed && closed;
     }
 
-    static bool checkpoints_load_sidecar(std::list<common_prompt_checkpoint> & checkpoints, const std::string & filepath) {
+    static bool checkpoints_load_sidecar(std::list<common_prompt_checkpoint> & checkpoints, const std::string & filepath, size_t token_count) {
+        std::error_code ec;
+        uint64_t remaining = std::filesystem::file_size(filepath, ec);
+        if (ec || remaining < 12) {
+            return false;
+        }
         FILE * f = fopen(filepath.c_str(), "rb");
         if (f == nullptr) {
             return false;
         }
 
         uint32_t magic = 0, version = 0, count = 0;
+        auto close = [](FILE * file) { fclose(file); };
+        std::unique_ptr<FILE, decltype(close)> guard(f, close);
 
         bool ok = fread(&magic,   sizeof(magic),   1, f) == 1 &&
                   fread(&version, sizeof(version), 1, f) == 1 &&
@@ -2785,8 +2797,14 @@ private:
                   magic == 0x4C434B50 && version == 1 && count <= 1024;
 
         std::list<common_prompt_checkpoint> loaded;
+        remaining -= 12;
 
         for (uint32_t i = 0; ok && i < count; ++i) {
+            if (remaining < 32) {
+                ok = false;
+                break;
+            }
+            remaining -= 32;
             auto & cur = loaded.emplace_back();
 
             uint64_t n_tgt = 0;
@@ -2799,9 +2817,14 @@ private:
             ok = ok && fread(&n_dft,        sizeof(n_dft),        1, f) == 1;
 
             // sanity: refuse absurd blob sizes (16 GiB per blob)
-            ok = ok && n_tgt <= (1ull << 34) && n_dft <= (1ull << 34);
+            ok = ok && n_tgt <= (1ull << 34) && n_dft <= (1ull << 34) &&
+                 n_tgt <= remaining && n_dft <= remaining - n_tgt &&
+                 n_tgt <= SIZE_MAX && n_dft <= SIZE_MAX &&
+                 cur.n_tokens >= 0 && static_cast<uint64_t>(cur.n_tokens) <= token_count &&
+                 cur.pos_min >= 0 && cur.pos_max >= cur.pos_min;
 
             if (ok) {
+                remaining -= n_tgt + n_dft;
                 cur.data_tgt.resize(n_tgt);
                 cur.data_dft.resize(n_dft);
                 ok = ok && (n_tgt == 0 || fread(cur.data_tgt.data(), 1, n_tgt, f) == n_tgt);
@@ -2809,9 +2832,10 @@ private:
             }
         }
 
-        fclose(f);
+        ok = ok && remaining == 0 && !ferror(f);
+        const bool closed = fclose(guard.release()) == 0;
 
-        if (!ok) {
+        if (!ok || !closed) {
             return false;
         }
 
@@ -3063,7 +3087,6 @@ private:
 
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
-                    const std::string mtmd_filepath = filepath + ".mtmd";
                     const bool has_media = slot->prompt.tokens.has_media();
 
                     if (has_media && (!mctx || mmproj_hash.empty())) {
@@ -3080,61 +3103,34 @@ private:
                         break;
                     }
 
-                    // Keep media placeholders so the state file and mtmd sidecar use the same token indices.
-                    const llama_tokens & tokens = slot->prompt.tokens.get_tokens();
-                    const size_t token_count = tokens.size();
-                    const size_t nwrite = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), token_count);
-                    if (nwrite == 0) {
-                        send_error(task, "Unable to save slot state file", ERROR_TYPE_SERVER);
-                        break;
+                    try {
+                        server_slot_save saved(filepath);
+                        const llama_tokens & tokens = slot->prompt.tokens.get_tokens();
+                        const size_t nwrite = llama_state_seq_save_file(ctx_tgt, saved.path(server_slot_save::KV).c_str(), slot->id, tokens.data(), tokens.size());
+                        if (nwrite == 0) {
+                            throw std::runtime_error("Unable to save slot state file");
+                        }
+                        if (has_media && slot->prompt.tokens.save_mtmd_sidecar(saved.path(server_slot_save::MTMD), mmproj_hash) == 0) {
+                            throw std::runtime_error("Failed to save mtmd component");
+                        }
+                        const bool has_checkpoints = !slot->prompt.checkpoints.empty();
+                        if (has_checkpoints && !checkpoints_save_sidecar(slot->prompt.checkpoints, saved.path(server_slot_save::CKPT))) {
+                            throw std::runtime_error("Failed to save checkpoint component");
+                        }
+                        saved.commit(has_media, has_checkpoints);
+
+                        auto res = std::make_unique<server_task_result_slot_save_load>();
+                        res->id       = task.id;
+                        res->id_slot  = id_slot;
+                        res->filename = filename;
+                        res->is_save  = true;
+                        res->n_tokens = tokens.size();
+                        res->n_bytes  = saved.total_size();
+                        res->t_ms     = (ggml_time_us() - t_start) / 1000.0;
+                        queue_results.send(std::move(res));
+                    } catch (const std::exception & err) {
+                        send_error(task, err.what(), ERROR_TYPE_SERVER);
                     }
-
-                    // SAIVerse fork extension: save mtmd sidecar if multimodal media chunks exist
-                    size_t nwrite_mtmd = 0;
-                    if (has_media) {
-                        nwrite_mtmd = slot->prompt.tokens.save_mtmd_sidecar(mtmd_filepath, mmproj_hash);
-                        if (nwrite_mtmd == 0) {
-                            std::error_code remove_ec;
-                            std::filesystem::remove(mtmd_filepath, remove_ec);
-                            send_error(task, "Failed to save mtmd sidecar file",
-                                       ERROR_TYPE_SERVER);
-                            break;
-                        }
-                    } else {
-                        std::error_code remove_ec;
-                        const bool removed = std::filesystem::remove(mtmd_filepath, remove_ec);
-                        if (remove_ec) {
-                            send_error(task, "Failed to remove stale mtmd sidecar file",
-                                       ERROR_TYPE_SERVER);
-                            break;
-                        }
-                        if (removed) {
-                            SLT_INF(*slot, "removed stale mtmd sidecar %s\n", mtmd_filepath.c_str());
-                        }
-                    }
-
-                    const int64_t t_end = ggml_time_us();
-                    const double t_save_ms = (t_end - t_start) / 1000.0;
-
-                    // persist context checkpoints alongside the state file so that a
-                    // restore in a fresh process can roll back mid-prompt (see restore path)
-                    if (!slot->prompt.checkpoints.empty()) {
-                        if (checkpoints_save_sidecar(slot->prompt.checkpoints, filepath + ".ckpt")) {
-                            SLT_INF(*slot, "saved %zu context checkpoints to sidecar\n", slot->prompt.checkpoints.size());
-                        } else {
-                            SLT_WRN(*slot, "failed to write checkpoint sidecar %s\n", (filepath + ".ckpt").c_str());
-                        }
-                    }
-
-                    auto res = std::make_unique<server_task_result_slot_save_load>();
-                    res->id       = task.id;
-                    res->id_slot  = id_slot;
-                    res->filename = filename;
-                    res->is_save  = true;
-                    res->n_tokens = token_count;
-                    res->n_bytes  = nwrite + nwrite_mtmd;
-                    res->t_ms     = t_save_ms;
-                    queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SLOT_RESTORE:
                 {
@@ -3155,103 +3151,92 @@ private:
 
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
-                    const std::string mtmd_filepath = filepath + ".mtmd";
-                    std::error_code sidecar_ec;
-                    const bool has_mtmd_sidecar = std::filesystem::exists(mtmd_filepath, sidecar_ec);
-
-                    if (sidecar_ec) {
-                        send_error(task, "Unable to inspect mtmd sidecar file",
-                                   ERROR_TYPE_SERVER);
-                        break;
-                    }
-
-                    if (has_mtmd_sidecar && !mctx) {
-                        send_error(task,
-                            "Cannot restore multimodal cache without mmproj; "
-                            "start the server with --mmproj to use this cache file",
-                            ERROR_TYPE_INVALID_REQUEST);
-                        break;
-                    }
-                    if (has_mtmd_sidecar && mmproj_hash.empty()) {
-                        send_error(task,
-                            "mmproj fingerprint not available; cannot verify cache compatibility",
-                            ERROR_TYPE_SERVER);
-                        break;
-                    }
-
-                    llama_tokens tokens;
-                    tokens.resize(slot->n_ctx);
-                    size_t token_count = 0;
-                    slot->prompt.checkpoints.clear();
-                    size_t nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), tokens.size(), &token_count);
-                    if (nread == 0) {
-                        slot->prompt_clear(); // KV may already been invalidated?
-                        send_error(task, "Unable to restore slot, no available space in KV cache or invalid slot save file", ERROR_TYPE_INVALID_REQUEST);
-                        break;
-                    }
-                    tokens.resize(token_count);
-                    if (!has_mtmd_sidecar &&
-                        std::find(tokens.begin(), tokens.end(), LLAMA_TOKEN_NULL) != tokens.end()) {
-                        slot->prompt_clear();
-                        send_error(task,
-                            "Cannot restore multimodal cache because its mtmd sidecar is missing",
-                            ERROR_TYPE_INVALID_REQUEST);
-                        break;
-                    }
-                    slot->prompt.clear();
-                    slot->prompt.tokens.insert(tokens);
-
-                    // Restore media metadata before checkpoints so the prompt token
-                    // graph is complete before any checkpoint fallback is synthesized.
-                    size_t nread_mtmd = 0;
-                    if (has_mtmd_sidecar) {
-                        if (!slot->prompt.tokens.load_mtmd_sidecar(mtmd_filepath, mmproj_hash)) {
-                            slot->prompt_clear();
-                            send_error(task,
-                                "Failed to load mtmd sidecar (mmproj mismatch, version mismatch, or corrupt file)",
-                                ERROR_TYPE_INVALID_REQUEST);
-                            break;
+                    bool state_load_started = false;
+                    try {
+                        server_slot_save saved(filepath);
+                        saved.unpack();
+                        const bool has_media = saved.has(server_slot_save::MTMD);
+                        if (has_media && !mctx) {
+                            throw std::runtime_error("Cannot restore multimodal cache without mmproj");
                         }
-                        // record bytes read for response
-                        std::error_code ec;
-                        const auto sz = std::filesystem::file_size(mtmd_filepath, ec);
-                        if (!ec) {
-                            nread_mtmd = static_cast<size_t>(sz);
+                        if (has_media && mmproj_hash.empty()) {
+                            throw std::runtime_error("mmproj fingerprint not available; cannot verify cache compatibility");
                         }
-                    }
 
-                    // Checkpoints are a separate sidecar used for SWA and recurrent
-                    // rollback. Keep them alongside the multimodal metadata.
-                    if (params_base.n_ctx_checkpoints > 0 && token_count > 0) {
-                        if (checkpoints_load_sidecar(slot->prompt.checkpoints, filepath + ".ckpt")) {
-                            SLT_INF(*slot, "restored %zu context checkpoints from sidecar\n", slot->prompt.checkpoints.size());
-                        } else {
-                            const llama_pos p_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot->id);
-                            const llama_pos p_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id);
-                            if (p_min >= 0 && p_max >= p_min) {
-                                create_checkpoint(*slot, 0, p_min, p_max);
+                        // Validate the complete token/media/checkpoint graph before changing the slot.
+                        std::ifstream in(saved.path(server_slot_save::KV), std::ios::binary);
+                        uint32_t header[3] = {};
+                        in.read(reinterpret_cast<char *>(header), sizeof(header));
+                        if (!in || header[0] != LLAMA_STATE_SEQ_MAGIC || header[1] != LLAMA_STATE_SEQ_VERSION ||
+                            header[2] > static_cast<uint32_t>(slot->n_ctx) || saved.size(server_slot_save::KV) < sizeof(header) ||
+                            header[2] > (saved.size(server_slot_save::KV) - sizeof(header)) / sizeof(llama_token)) {
+                            throw std::runtime_error("Invalid slot state token header");
+                        }
+                        llama_tokens tokens(header[2]);
+                        in.read(reinterpret_cast<char *>(tokens.data()), tokens.size() * sizeof(llama_token));
+                        if (!in) {
+                            throw std::runtime_error("Invalid slot state tokens");
+                        }
+                        in.close();
+                        if (in.fail()) {
+                            throw std::runtime_error("Unable to close slot state token file");
+                        }
+                        if (!has_media && std::find(tokens.begin(), tokens.end(), LLAMA_TOKEN_NULL) != tokens.end()) {
+                            throw std::runtime_error("Cannot restore multimodal cache because its mtmd component is missing");
+                        }
+                        server_tokens restored_tokens(tokens, mctx != nullptr);
+                        if (has_media && !restored_tokens.load_mtmd_sidecar(saved.path(server_slot_save::MTMD), mmproj_hash)) {
+                            throw std::runtime_error("Failed to load mtmd component (mmproj mismatch, version mismatch, or corrupt file)");
+                        }
+                        if (!restored_tokens.validate(ctx_tgt)) {
+                            throw std::runtime_error("Invalid token in slot state");
+                        }
+                        std::list<common_prompt_checkpoint> checkpoints;
+                        if (saved.has(server_slot_save::CKPT) && !checkpoints_load_sidecar(checkpoints, saved.path(server_slot_save::CKPT), tokens.size())) {
+                            throw std::runtime_error("Invalid checkpoint component");
+                        }
+
+                        size_t token_count = 0;
+                        state_load_started = true;
+                        const size_t nread = llama_state_seq_load_file(ctx_tgt, saved.path(server_slot_save::KV).c_str(), slot->id,
+                                                                     tokens.data(), tokens.size(), &token_count);
+                        if (nread == 0 || nread != saved.size(server_slot_save::KV) || token_count != restored_tokens.size()) {
+                            throw std::runtime_error("Unable to restore slot, no available space in KV cache or invalid slot save file");
+                        }
+                        slot->prompt.clear();
+                        slot->prompt.tokens = std::move(restored_tokens);
+                        if (params_base.n_ctx_checkpoints > 0 && token_count > 0) {
+                            if (saved.has(server_slot_save::CKPT)) {
+                                slot->prompt.checkpoints = std::move(checkpoints);
+                            } else {
+                                const llama_pos p_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot->id);
+                                const llama_pos p_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id);
+                                if (p_min >= 0 && p_max >= p_min) {
+                                    create_checkpoint(*slot, 0, p_min, p_max);
+                                }
                             }
                         }
+
+                        auto res = std::make_unique<server_task_result_slot_save_load>();
+                        res->id       = task.id;
+                        res->id_slot  = id_slot;
+                        res->filename = filename;
+                        res->is_save  = false;
+                        res->n_tokens = token_count;
+                        res->n_bytes  = saved.total_size();
+                        res->t_ms     = (ggml_time_us() - t_start) / 1000.0;
+                        queue_results.send(std::move(res));
+                    } catch (const std::exception & err) {
+                        if (state_load_started) {
+                            slot->prompt_clear();
+                        }
+                        send_error(task, err.what(), ERROR_TYPE_INVALID_REQUEST);
                     }
-
-                    const int64_t t_end = ggml_time_us();
-                    const double t_restore_ms = (t_end - t_start) / 1000.0;
-
-                    auto res = std::make_unique<server_task_result_slot_save_load>();
-                    res->id       = task.id;
-                    res->id_slot  = id_slot;
-                    res->filename = filename;
-                    res->is_save  = false;
-                    res->n_tokens = token_count;
-                    res->n_bytes  = nread + nread_mtmd;
-                    res->t_ms     = t_restore_ms;
-                    queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SLOT_ERASE:
                 {
                     // SAIVerse fork: media gate removed here too.
-                    // SLOT_ERASE only clears in-memory KV state and never touches sidecar files
-                    // (matching the existing behavior where the on-disk .bin is also not deleted).
+                    // SLOT_ERASE only clears in-memory state; saved containers remain on disk.
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {

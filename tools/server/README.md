@@ -1092,6 +1092,16 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 
 `filename`: Name of the file to save the slot's prompt cache. The file will be saved in the directory specified by the `--slot-save-path` server parameter.
 
+The requested filename contains one versioned slot-save container, including the token/KV state, optional multimodal metadata, and optional context checkpoints. A SHA-256 digest binds the header, section presence and sizes, and all section bytes to one saved generation. Saving a text-only slot works on a server with an mmproj loaded. Reusing a filename replaces the entire container, so media or checkpoints from an earlier save cannot be reused accidentally.
+
+The server writes a private temporary save and replaces the destination only after every section and the container have been written and closed successfully. An ordinary save failure leaves an existing save unchanged. Replacement provides atomic visibility on supported local filesystems; it does not guarantee durability after a power loss. Windows requires filesystem/OS support for POSIX-style file replacement (FileRenameInfoEx); unsupported replacement fails without changing the existing save, with no non-atomic fallback. The server does not read, overwrite, or delete external `filename.mtmd` or `filename.ckpt` files, including files left by older versions.
+
+New saves are owner-only: mode `0600` on POSIX and an ACL granting access only to the server's process user on Windows. Replacing a previously shared save intentionally narrows its access permissions.
+
+Container hashing and copying use bounded streaming buffers rather than another full in-memory copy. Allow approximately twice the size of the new saved state in additional temporary disk space during save, alongside any existing destination file. Ordinary failures clean up the operation's private temporary directory. A process crash can leave an orphaned temporary directory; the server does not scan for or delete unknown files, so remove confirmed orphans manually while the server is stopped.
+
+`n_saved` counts saved tokens. `n_written` is the complete container size in bytes, including metadata, checkpoints, and the integrity digest.
+
 **Response format**
 
 ```json
@@ -1112,6 +1122,12 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 
 `filename`: Name of the file to restore the slot's prompt cache from. The file should be located in the directory specified by the `--slot-save-path` server parameter.
 
+Restore verifies the container's version, declared sections, exact file size, aggregate digest, multimodal compatibility, and checkpoint structure before changing the slot. A corrupt or truncated declared checkpoint is rejected; an absent checkpoint is allowed and may require prompt recomputation. Multimodal saves require the matching mmproj. Use saved caches only with the model and context configuration they were created with.
+
+This server rejects legacy raw KV files, including saves accompanied by `.mtmd` and `.ckpt` sidecars, because those files do not bind all state to the same generation. Older servers cannot read the new container format. Recreate caches by processing their original prompts and saving again; renaming or copying old sidecars does not convert them. External sidecars are ignored and preserved.
+
+Restore stages verified sections in a private temporary directory and requires the `--slot-save-path` directory to be writable. Allow approximately one saved state's size in additional temporary disk space. `n_restored` counts restored tokens, and `n_read` is the complete container size, including optional sections and the integrity digest.
+
 **Response format**
 
 ```json
@@ -1127,6 +1143,8 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 ```
 
 ### POST `/slots/{id_slot}?action=erase`: Erase the prompt cache of the specified slot.
+
+This clears only the slot's in-memory state, including media and checkpoints. Saved containers and external files are not deleted.
 
 **Response format**
 
