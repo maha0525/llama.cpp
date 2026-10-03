@@ -18,6 +18,9 @@ extern "C" {
 #include <vector>
 
 #ifdef _WIN32
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00
+#endif
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -80,6 +83,36 @@ std::unique_ptr<void, local_free> directory_security() {
         fail("cannot create private staging permissions");
     }
     return std::unique_ptr<void, local_free>(descriptor);
+}
+
+void replace_file(const fs::path & source, const fs::path & target) {
+    const std::wstring destination = fs::absolute(target).native();
+    if (destination.size() > (std::numeric_limits<DWORD>::max() - sizeof(FILE_RENAME_INFO)) / sizeof(wchar_t)) {
+        fail("replacement path is too long");
+    }
+    const size_t name_size = destination.size() * sizeof(wchar_t);
+    std::vector<unsigned char> buffer(sizeof(FILE_RENAME_INFO) + name_size, 0);
+    auto * info = reinterpret_cast<FILE_RENAME_INFO *>(buffer.data());
+    info->Flags = FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
+    info->RootDirectory = nullptr;
+    info->FileNameLength = static_cast<DWORD>(name_size);
+    std::memcpy(info->FileName, destination.data(), name_size);
+
+    // All data streams are already closed. This handle only changes the directory entry.
+    HANDLE raw_handle = CreateFileW(source.c_str(), DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                    nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (raw_handle == INVALID_HANDLE_VALUE) {
+        fail("cannot open save for replacement (Windows error " + std::to_string(GetLastError()) + ")");
+    }
+    std::unique_ptr<void, handle_closer> handle(raw_handle);
+    // MoveFileEx cannot replace an open generation atomically. Require Windows 10 POSIX rename support.
+    if (!SetFileInformationByHandle(handle.get(), FileRenameInfoEx, info, static_cast<DWORD>(buffer.size()))) {
+        const auto error = GetLastError();
+        if (error == ERROR_INVALID_PARAMETER || error == ERROR_INVALID_FUNCTION || error == ERROR_NOT_SUPPORTED) {
+            fail("atomic replacement requires Windows 10 POSIX rename support on this filesystem (Windows error " + std::to_string(error) + ")");
+        }
+        fail("cannot replace committed save (Windows error " + std::to_string(error) + ")");
+    }
 }
 #endif
 
@@ -349,9 +382,7 @@ void server_slot_save::commit(bool mtmd_present, bool ckpt_present) {
     close_file(output, p->hook, true);
     check_hook(p->hook, "rename");
 #ifdef _WIN32
-    if (!MoveFileExW(p->container.c_str(), p->filename.c_str(), MOVEFILE_REPLACE_EXISTING)) {
-        fail("cannot replace committed save (Windows error " + std::to_string(GetLastError()) + ")");
-    }
+    replace_file(p->container, p->filename);
 #else
     if (std::rename(p->container.c_str(), p->filename.c_str()) != 0) {
         fail("cannot replace committed save");

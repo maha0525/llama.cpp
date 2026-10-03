@@ -15,7 +15,12 @@
 #include <thread>
 #include <vector>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -239,6 +244,21 @@ void test_missing_components_and_rename(const fs::path & directory) {
     CHECK(read_file(blocked / "keep") == "untouched");
     CHECK(fs::remove(blocked / "keep"));
     CHECK(fs::remove(blocked));
+#ifdef _WIN32
+    const std::array<std::string, 3> old_parts = { "old KV", "old media", "old checkpoint" };
+    const std::array<std::string, 3> new_parts = { "new KV", "new media", "new checkpoint" };
+    commit(path, old_parts);
+    const auto original = read_file(path);
+    // A reader that denies delete sharing must block replacement without losing the old save.
+    HANDLE locked = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    CHECK(locked != INVALID_HANDLE_VALUE);
+    rejected([&] { commit(path, new_parts); });
+    CHECK(read_file(path) == original);
+    CHECK(CloseHandle(locked));
+    check_parts(path, old_parts);
+    commit(path, new_parts);
+    check_parts(path, new_parts);
+#endif
     check_no_staging(directory);
 }
 
