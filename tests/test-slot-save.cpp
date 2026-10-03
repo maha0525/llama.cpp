@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -419,15 +420,32 @@ void test_concurrent_readers(const fs::path & directory) {
 } // namespace
 
 int main() {
+    std::set_terminate([] {
+        try {
+            if (auto error = std::current_exception()) {
+                std::rethrow_exception(error);
+            }
+        } catch (const std::exception & error) {
+            std::fprintf(stderr, "Unhandled test exception: %s\n", error.what());
+        }
+        std::abort();
+    });
     test_directory directory;
+    std::fprintf(stderr, "test_roundtrip_and_overwrite\n");
     test_roundtrip_and_overwrite(directory.path);
+    std::fprintf(stderr, "test_invalid_containers\n");
     test_invalid_containers(directory.path);
+    std::fprintf(stderr, "test_missing_components_and_rename\n");
     test_missing_components_and_rename(directory.path);
+    std::fprintf(stderr, "test_failure_injection\n");
     test_failure_injection(directory.path);
+    std::fprintf(stderr, "test_cleanup_ownership\n");
     test_cleanup_ownership(directory.path);
 #ifndef _WIN32
+    std::fprintf(stderr, "test_process_interruption\n");
     test_process_interruption(directory.path);
 #endif
+    std::fprintf(stderr, "test_concurrent_readers\n");
     test_concurrent_readers(directory.path);
     std::puts("test-slot-save: OK");
     return 0;

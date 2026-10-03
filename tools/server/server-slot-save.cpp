@@ -96,7 +96,8 @@ file_ptr open_file(const fs::path & path, bool write) {
                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                                write ? CREATE_NEW : OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (handle == INVALID_HANDLE_VALUE) {
-        fail("cannot open " + path.u8string());
+        const auto error = GetLastError();
+        fail("cannot open " + path.u8string() + " (Windows error " + std::to_string(error) + ")");
     }
     int fd = _open_osfhandle(reinterpret_cast<intptr_t>(handle), _O_BINARY | (write ? _O_WRONLY : _O_RDONLY));
     if (fd == -1) {
@@ -349,11 +350,13 @@ void server_slot_save::commit(bool mtmd_present, bool ckpt_present) {
     check_hook(p->hook, "rename");
 #ifdef _WIN32
     if (!MoveFileExW(p->container.c_str(), p->filename.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        fail("cannot replace committed save (Windows error " + std::to_string(GetLastError()) + ")");
+    }
 #else
     if (std::rename(p->container.c_str(), p->filename.c_str()) != 0) {
-#endif
         fail("cannot replace committed save");
     }
+#endif
     p->present = present;
     p->lengths = lengths;
 }

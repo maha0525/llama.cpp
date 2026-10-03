@@ -54,6 +54,22 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  slot-save:
+    name: Slot save integrity (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Configure
+        run: cmake -B build-slot-save -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_UI=OFF -DGGML_NATIVE=OFF
+      - name: Build
+        run: cmake --build build-slot-save --config Release --target test-slot-save -j 2
+      - name: Test
+        run: ctest --test-dir build-slot-save -C Release -R "^test-slot-save$" --output-on-failure
+
   ubuntu:
     runs-on: ubuntu-24.04-arm
 
